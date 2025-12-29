@@ -1,0 +1,9 @@
+{
+  // Use the .clang-format file in the project root
+  "C_Cpp.clang_format_style": "file",
+  "C_Cpp.formatting": "clangFormat",
+  // Disable format on save - format manually when needed
+  "editor.formatOnSave": true,
+  "editor.formatOnPaste": true,
+  "editor.formatOnType": true,
+}
