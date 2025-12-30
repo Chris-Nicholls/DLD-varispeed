@@ -78,6 +78,11 @@ float write_fade_pos[NUM_CHAN];
 
 uint8_t doing_reverse_fade[NUM_CHAN] = {0,0};
 
+// Varispeed state
+float fractional_read_pos[NUM_CHAN] = {0.0f, 0.0f};
+float read_speed[NUM_CHAN] = {1.0f, 1.0f};
+float target_read_speed[NUM_CHAN] = {1.0f, 1.0f};
+
 float lpf_coef;
 int32_t min_vol;
 float mainin_lpf[2]={0.0,0.0}, auxin_lpf[2]={0.0,0.0}, dcblock_lpf[2]={0.0,0.0};
@@ -117,6 +122,9 @@ void audio_buffer_init(void)
 
 		loop_start[i] = LOOP_RAM_BASE[i];
 		loop_end[i] = LOOP_RAM_BASE[i] + LOOP_SIZE;
+		
+		fractional_read_pos[i] = 0.0f;
+		read_speed[i] = 1.0f;
 		doing_reverse_fade[i]=0;
 	}
 
@@ -650,7 +658,25 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	// reversed direction, so we should continue reading from rd_buff in the same direction (which is now !REV),
 	// and cross fade towards dest_rd_buff being read in the direction of REV
 
-	crossed_start_fade_addr = memory_read(read_addr, channel, rd_buff, sz/2, start_fade_addr, doing_reverse_fade[channel] /*| mode[channel][CONTINUOUS_REVERSE]*/);
+	if (mode[channel][INF] == INF_OFF) {
+		// Slew read_speed toward target_read_speed
+		float slew = 0.001f;
+		if (read_speed[channel] < target_read_speed[channel]) {
+			read_speed[channel] += slew;
+			if (read_speed[channel] > target_read_speed[channel])
+				read_speed[channel] = target_read_speed[channel];
+		} else if (read_speed[channel] > target_read_speed[channel]) {
+			read_speed[channel] -= slew;
+			if (read_speed[channel] < target_read_speed[channel])
+				read_speed[channel] = target_read_speed[channel];
+		}
+		
+		// Normal mode: use varispeed
+		crossed_start_fade_addr = memory_read_varispeed(read_addr, &fractional_read_pos[channel], channel, rd_buff, sz/2, read_speed[channel], start_fade_addr, doing_reverse_fade[channel]);
+	} else {
+		// Freeze modes: use original memory_read
+		crossed_start_fade_addr = memory_read(read_addr, channel, rd_buff, sz/2, start_fade_addr, doing_reverse_fade[channel]);
+	}
 
 
 	if (mode[channel][INF]!=INF_OFF && crossed_start_fade_addr)
