@@ -44,6 +44,7 @@ enum Params{
 	MIX_DRY,		//MIX: 0..1 representing mix of delayed and clean on the main output
 	MIX_WET,
 	TRACKING_COMP,	//TRACKING_COMP: -2.0 .. 2.0 representing compensation for 1V/oct tracking
+	VARISPEED_INERTIA,	//VARISPEED_INERTIA: slew rate for varispeed changes (per-channel)
 	NUM_PARAMS
 };
 

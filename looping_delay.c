@@ -701,7 +701,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			read_speed[channel] = landing_speed;
 		} else {
 			// Slew read_speed toward target_read_speed
-			float slew = 0.001f;
+			float slew = param[channel][VARISPEED_INERTIA];
 			if (read_speed[channel] < target_read_speed[channel]) {
 				read_speed[channel] += slew;
 				if (read_speed[channel] > target_read_speed[channel])

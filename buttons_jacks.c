@@ -52,6 +52,7 @@ uint8_t flag_rev_change[2]={0,0};
 
 uint8_t flag_pot_changed_revdown[NUM_POT_ADCS]={0,0,0,0,0,0,0,0};
 uint8_t flag_pot_changed_infdown[NUM_POT_ADCS]={0,0,0,0,0,0,0,0};
+uint8_t flag_pot_changed_pingdown[NUM_POT_ADCS]={0,0,0,0,0,0,0,0};
 
 uint8_t ping_button_state=0;
 uint8_t ping_jack_state=0;
@@ -404,6 +405,15 @@ void INFREVBUTTONJACK_PINGBUT_IRQHandler(void)
 		}
 	}
 
+	// Ping button release: clear flag_pot_changed_pingdown flags
+	if (State[0]==0xf000)
+	{
+		if (flag_pot_changed_pingdown[TIME_POT*2])
+			flag_pot_changed_pingdown[TIME_POT*2]=0;
+
+		if (flag_pot_changed_pingdown[TIME_POT*2+1])
+			flag_pot_changed_pingdown[TIME_POT*2+1]=0;
+	}
 
 
 	//Todo: Create a global infbut_pressed[2] and revbut_pressed[2] reflecting the de-bounced state
@@ -623,4 +633,3 @@ void INFREVBUTTONJACK_PINGBUT_IRQHandler(void)
 #endif
 
 }
-

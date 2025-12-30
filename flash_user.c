@@ -123,6 +123,12 @@ extern int16_t i_smoothed_cvadc[NUM_POT_ADCS];
 #define FLASH_ADDR_SEND_RETURN_BEFORE_LOOP_1				(FLASH_ADDR_SEND_RETURN_BEFORE_LOOP_0		+ SZ_SRBL0)		/* 91 ..	*/
 #define SZ_SRBL1 1
 
+#define FLASH_ADDR_VARISPEED_INERTIA_0						(FLASH_ADDR_SEND_RETURN_BEFORE_LOOP_1		+ SZ_SRBL1)		/* 92 ..95	*/
+#define SZ_VI0 4
+
+#define FLASH_ADDR_VARISPEED_INERTIA_1						(FLASH_ADDR_VARISPEED_INERTIA_0				+ SZ_VI0)		/* 96 ..99	*/
+#define SZ_VI1 4
+
 
 #define FLASH_SYMBOL_bankfilled 0x01
 #define FLASH_SYMBOL_startupoffset 0xAA
@@ -136,6 +142,9 @@ int32_t flash_CODEC_ADC_CALIBRATION_DCOFFSET[4];
 
 float flash_param_TRACKING_COMP_0;
 float flash_param_TRACKING_COMP_1;
+
+float flash_param_VARISPEED_INERTIA_0;
+float flash_param_VARISPEED_INERTIA_1;
 
 uint32_t flash_global_param_FAST_FADE_SAMPLES;
 uint32_t flash_global_param_SLOW_FADE_SAMPLES;
@@ -246,6 +255,9 @@ uint32_t load_flash_params(void)
 		param[0][TRACKING_COMP] = flash_param_TRACKING_COMP_0;
 		param[1][TRACKING_COMP] = flash_param_TRACKING_COMP_1;
 
+		param[0][VARISPEED_INERTIA] = flash_param_VARISPEED_INERTIA_0;
+		param[1][VARISPEED_INERTIA] = flash_param_VARISPEED_INERTIA_1;
+
 		global_param[LOOP_LED_BRIGHTNESS] = flash_loop_led_brightness;
 
 		mode[0][LOOP_CLOCK_GATETRIG] = flash_mode_LOOP_CLOCK_GATETRIG_0;
@@ -348,6 +360,9 @@ void store_params_into_sram(void)
 	flash_param_TRACKING_COMP_0 = param[0][TRACKING_COMP];
 	flash_param_TRACKING_COMP_1 = param[1][TRACKING_COMP];
 
+	flash_param_VARISPEED_INERTIA_0 = param[0][VARISPEED_INERTIA];
+	flash_param_VARISPEED_INERTIA_1 = param[1][VARISPEED_INERTIA];
+
 	flash_global_param_FAST_FADE_SAMPLES = global_param[FAST_FADE_SAMPLES];
 	flash_global_param_SLOW_FADE_SAMPLES = global_param[SLOW_FADE_SAMPLES];
 
@@ -403,6 +418,9 @@ void write_all_params_to_FLASH(void)
 	flash_open_program_word(*(uint32_t *)&flash_param_TRACKING_COMP_0, FLASH_ADDR_TRACKING_COMP_0);
 	flash_open_program_word(*(uint32_t *)&flash_param_TRACKING_COMP_1, FLASH_ADDR_TRACKING_COMP_1);
 
+	flash_open_program_word(*(uint32_t *)&flash_param_VARISPEED_INERTIA_0, FLASH_ADDR_VARISPEED_INERTIA_0);
+	flash_open_program_word(*(uint32_t *)&flash_param_VARISPEED_INERTIA_1, FLASH_ADDR_VARISPEED_INERTIA_1);
+
 	flash_open_program_byte(flash_loop_led_brightness, FLASH_ADDR_loop_led_brightness);
 
 	flash_open_program_byte(flash_mode_LOOP_CLOCK_GATETRIG_0, FLASH_ADDR_LOOP_CLOCK_GATETRIG_0);
@@ -456,6 +474,14 @@ void read_all_params_from_FLASH(void)
 	flash_param_TRACKING_COMP_1 = flash_read_word(FLASH_ADDR_TRACKING_COMP_1);
 	if (flash_param_TRACKING_COMP_1 > 1.25 || flash_param_TRACKING_COMP_1 < 0.75)
 		flash_param_TRACKING_COMP_1 = 1.0;
+
+	flash_param_VARISPEED_INERTIA_0 = flash_read_word(FLASH_ADDR_VARISPEED_INERTIA_0);
+	if (flash_param_VARISPEED_INERTIA_0 < 0.0001 || flash_param_VARISPEED_INERTIA_0 > 0.02)
+		flash_param_VARISPEED_INERTIA_0 = 0.002;
+
+	flash_param_VARISPEED_INERTIA_1 = flash_read_word(FLASH_ADDR_VARISPEED_INERTIA_1);
+	if (flash_param_VARISPEED_INERTIA_1 < 0.0001 || flash_param_VARISPEED_INERTIA_1 > 0.02)
+		flash_param_VARISPEED_INERTIA_1 = 0.002;
 
 
 	flash_global_param_FAST_FADE_SAMPLES = flash_read_word(FLASH_ADDR_FAST_FADE_SAMPLES);
