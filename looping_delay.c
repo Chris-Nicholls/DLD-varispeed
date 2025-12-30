@@ -82,6 +82,7 @@ uint8_t doing_reverse_fade[NUM_CHAN] = {0,0};
 float fractional_read_pos[NUM_CHAN] = {0.0f, 0.0f};
 float read_speed[NUM_CHAN] = {1.0f, 1.0f};
 float target_read_speed[NUM_CHAN] = {1.0f, 1.0f};
+uint32_t target_read_addr[NUM_CHAN];
 
 float lpf_coef;
 int32_t min_vol;
@@ -125,6 +126,7 @@ void audio_buffer_init(void)
 		
 		fractional_read_pos[i] = 0.0f;
 		read_speed[i] = 1.0f;
+		target_read_addr[i] = read_addr[i];
 		doing_reverse_fade[i]=0;
 	}
 
@@ -363,21 +365,37 @@ void set_divmult_time(uint8_t channel){
 	}
 	else
 	{
-		if (read_fade_pos[channel] < global_param[SLOW_FADE_INCREMENT])
-		{
-
-			divmult_time[channel] = t_divmult_time;
-
-			fade_queued_dest_divmult_time[channel] = 0;
-
-			fade_dest_read_addr[channel] = calculate_read_addr(channel, divmult_time[channel]);
-
-			if (fade_dest_read_addr[channel] != read_addr[channel])
-				read_fade_pos[channel] = global_param[SLOW_FADE_INCREMENT];
-
-		} else
-			fade_queued_dest_divmult_time[channel]=t_divmult_time;
-
+		// INF_OFF mode: use varispeed catch-up instead of crossfade
+		divmult_time[channel] = t_divmult_time;
+		
+		// Calculate where read head should be
+		target_read_addr[channel] = calculate_read_addr(channel, divmult_time[channel]);
+		
+		// Calculate signed distance from current to target
+		int32_t distance = (int32_t)target_read_addr[channel] - (int32_t)read_addr[channel];
+		
+		// Handle wraparound
+		int32_t half_loop = (int32_t)(LOOP_SIZE / 2);
+		if (distance > half_loop)
+			distance -= LOOP_SIZE;
+		else if (distance < -half_loop)
+			distance += LOOP_SIZE;
+		
+		// Flip sign for reverse mode
+		if (mode[channel][REV])
+			distance = -distance;
+		
+		// Convert to samples
+		int32_t distance_samples = distance / SAMPLESIZE;
+		
+		// Set target speed based on distance
+		if (distance_samples > 8) {
+			target_read_speed[channel] = 2.0f;  // Speed up to catch up
+		} else if (distance_samples < -8) {
+			target_read_speed[channel] = 0.5f;  // Slow down
+		} else {
+			target_read_speed[channel] = 1.0f;  // Close enough
+		}
 	}
 
 }
@@ -659,16 +677,34 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	// and cross fade towards dest_rd_buff being read in the direction of REV
 
 	if (mode[channel][INF] == INF_OFF) {
-		// Slew read_speed toward target_read_speed
-		float slew = 0.001f;
-		if (read_speed[channel] < target_read_speed[channel]) {
-			read_speed[channel] += slew;
-			if (read_speed[channel] > target_read_speed[channel])
-				read_speed[channel] = target_read_speed[channel];
-		} else if (read_speed[channel] > target_read_speed[channel]) {
-			read_speed[channel] -= slew;
-			if (read_speed[channel] < target_read_speed[channel])
-				read_speed[channel] = target_read_speed[channel];
+		// Calculate distance to target
+		int32_t distance = (int32_t)target_read_addr[channel] - (int32_t)read_addr[channel];
+		int32_t half_loop = (int32_t)(LOOP_SIZE / 2);
+		if (distance > half_loop) distance -= LOOP_SIZE;
+		else if (distance < -half_loop) distance += LOOP_SIZE;
+		if (mode[channel][REV]) distance = -distance;
+		int32_t distance_samples = distance / SAMPLESIZE;
+		
+		// Calculate speed to land exactly on target in one buffer
+		int32_t buffer_samples = sz / 2;
+		float landing_speed = 1.0f + (float)distance_samples / (float)buffer_samples;
+		
+		// If landing speed is within our range, use it (precise landing)
+		// Otherwise, slew toward target speed (musical pitch change)
+		if (landing_speed >= 0.5f && landing_speed <= 2.0f) {
+			read_speed[channel] = landing_speed;
+		} else {
+			// Slew read_speed toward target_read_speed
+			float slew = 0.001f;
+			if (read_speed[channel] < target_read_speed[channel]) {
+				read_speed[channel] += slew;
+				if (read_speed[channel] > target_read_speed[channel])
+					read_speed[channel] = target_read_speed[channel];
+			} else if (read_speed[channel] > target_read_speed[channel]) {
+				read_speed[channel] -= slew;
+				if (read_speed[channel] < target_read_speed[channel])
+					read_speed[channel] = target_read_speed[channel];
+			}
 		}
 		
 		// Normal mode: use varispeed
@@ -722,7 +758,10 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 	}
 
-	memory_read(fade_dest_read_addr, channel, rd_buff_dest, sz/2, 0, 0 /* + mode[channel][CONTINUOUS_REVERSE]*/);
+	// Read crossfade destination buffer (only needed for freeze modes, not varispeed)
+	if (mode[channel][INF] != INF_OFF) {
+		memory_read(fade_dest_read_addr, channel, rd_buff_dest, sz/2, 0, 0 /* + mode[channel][CONTINUOUS_REVERSE]*/);
+	}
 
 	for (i=0;i<(sz/2);i++){
 
@@ -836,9 +875,15 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 
 		// Read from the loop and save this value so we can output it to the Delay Out jack
-		t = (uint16_t)(4095.0 * read_fade_pos[channel]);
-		asm("usat %[dst], #12, %[src]" : [dst] "=r" (t) : [src] "r" (t));
-		rd=((float)rd_buff[i] * epp_lut[t]) + ((float)rd_buff_dest[i] * epp_lut[4095-t]);
+		if (mode[channel][INF] == INF_OFF) {
+			// Varispeed mode: use interpolated samples directly
+			rd = rd_buff[i];
+		} else {
+			// Freeze modes: crossfade between buffers
+			t = (uint16_t)(4095.0 * read_fade_pos[channel]);
+			asm("usat %[dst], #12, %[src]" : [dst] "=r" (t) : [src] "r" (t));
+			rd = ((float)rd_buff[i] * epp_lut[t]) + ((float)rd_buff_dest[i] * epp_lut[4095-t]);
+		}
 
 
 
