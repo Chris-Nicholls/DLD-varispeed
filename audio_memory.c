@@ -35,6 +35,10 @@ extern const uint32_t LOOP_RAM_BASE[NUM_CHAN];
 
 extern uint8_t SAMPLESIZE;
 
+// From looping_delay.c - address increment/decrement functions that handle REV mode
+extern uint32_t inc_addr(uint32_t addr, uint8_t channel);
+extern uint32_t dec_addr(uint32_t addr, uint8_t channel);
+
 void memory_clear(uint8_t channel)
 {
 
@@ -81,6 +85,67 @@ uint32_t memory_read(uint32_t *addr, uint8_t channel, int32_t *rd_buff, uint8_t 
 	return(heads_crossed);
 }
 
+uint32_t memory_read_varispeed(uint32_t *addr, float *frac_pos, uint8_t channel, int32_t *rd_buff, uint8_t num_samples, float speed, uint32_t loop_addr, uint8_t decrement)
+{
+	uint8_t i;
+	uint32_t heads_crossed = 0;
+	int32_t sample0, sample1;
+	uint32_t next_addr;
+	float frac;
+
+	for (i = 0; i < num_samples; i++) {
+		// Enforce valid addr range
+		if ((addr[channel] < SDRAM_BASE) || (addr[channel] > (SDRAM_BASE + SDRAM_SIZE)))
+			addr[channel] = SDRAM_BASE;
+
+		// Even addresses only
+		addr[channel] = (addr[channel] & 0xFFFFFFFE);
+
+		// Get fractional position
+		frac = *frac_pos;
+
+		// Read current sample
+		while(FMC_GetFlagStatus(FMC_Bank2_SDRAM, FMC_FLAG_Busy) != RESET){;}
+		if (SAMPLESIZE == 2)
+			sample0 = *((int16_t *)(addr[channel]));
+		else
+			sample0 = *((int32_t *)(addr[channel]));
+
+		// Calculate next address for interpolation (using same direction logic)
+		if (decrement)
+			next_addr = dec_addr(addr[channel], channel);
+		else
+			next_addr = inc_addr(addr[channel], channel);
+
+		// Read next sample for interpolation
+		while(FMC_GetFlagStatus(FMC_Bank2_SDRAM, FMC_FLAG_Busy) != RESET){;}
+		if (SAMPLESIZE == 2)
+			sample1 = *((int16_t *)(next_addr));
+		else
+			sample1 = *((int32_t *)(next_addr));
+
+		// Linear interpolation
+		rd_buff[i] = (int32_t)((float)sample0 * (1.0f - frac) + (float)sample1 * frac);
+
+		// Advance fractional position by speed
+		*frac_pos += speed;
+
+		// When frac_pos >= 1.0, advance the address
+		while (*frac_pos >= 1.0f) {
+			*frac_pos -= 1.0f;
+
+			if (decrement)
+				addr[channel] = dec_addr(addr[channel], channel);
+			else
+				addr[channel] = inc_addr(addr[channel], channel);
+
+			if (addr[channel] == loop_addr)
+				heads_crossed = 1;
+		}
+	}
+
+	return heads_crossed;
+}
 
 void memory_write(uint32_t *addr, uint8_t channel, int32_t *wr_buff, uint8_t num_samples, uint8_t decrement)
 {
