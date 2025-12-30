@@ -649,18 +649,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		}
 	}
 
-	 //
-	 // Sanity check: make sure read_addr and write_addr are spaced properly
-	 //
-	if ((mode[channel][INF]==INF_OFF) && (read_fade_pos[channel] < global_param[SLOW_FADE_INCREMENT]) /*&& !mode[channel][CONTINUOUS_REVERSE]*/)
-	{
-		t32 = calculate_read_addr(channel, divmult_time[channel]);
-		if (t32 != read_addr[channel])
-		{
-			set_divmult_time(channel);
-		}
 
-	}
 
 	//For short periods (audio rate), disble crossfading before the end of the loop
 	if (divmult_time[channel] < (global_param[SLOW_FADE_SAMPLES]))
@@ -685,22 +674,14 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		if (mode[channel][REV]) distance = -distance;
 		int32_t distance_samples = distance / SAMPLESIZE;
 		
-		// Calculate speed to land exactly on target in one buffer
+		// If within one buffer of target, snap to normal speed
+		// Otherwise, slew toward target speed (2.0 or 0.5)
 		int32_t buffer_samples = sz / 2;
-		float landing_speed = 1.0f + (float)distance_samples / (float)buffer_samples;
-		
-		// Only use landing speed if:
-		// 1. We're actually catching up (distance > one buffer)
-		// 2. Landing speed is within our valid range
-		// Otherwise use normal 1.0 speed or slew toward target
 		if (distance_samples >= -buffer_samples && distance_samples <= buffer_samples) {
-			// Within one buffer - just use normal speed
+			// Within one buffer - snap to normal speed
 			read_speed[channel] = 1.0f;
-		} else if (landing_speed >= 0.5f && landing_speed <= 2.0f) {
-			// Can land exactly in one buffer
-			read_speed[channel] = landing_speed;
 		} else {
-			// Slew read_speed toward target_read_speed
+			// Far from target - slew toward target speed
 			float slew = param[channel][VARISPEED_INERTIA];
 			if (read_speed[channel] < target_read_speed[channel]) {
 				read_speed[channel] += slew;

@@ -113,7 +113,7 @@ void init_params(void)
 		param[channel][MIX_DRY] = 0.7;
 		param[channel][MIX_WET] = 0.7;
 		param[channel][TRACKING_COMP] = 1.02;
-		param[channel][VARISPEED_INERTIA] = 0.002;  // ~80ms slew time
+		param[channel][VARISPEED_INERTIA] = 0.00083f;  // ~100ms slew time
 	}
 
 }
@@ -286,13 +286,14 @@ void process_adc(void)
 
 	for (i=0;i<NUM_CHAN;i++)
 	{
-		//PING + TIME sets varispeed inertia (0.0004 to 0.02 slew rate per sample)
-		// 0.0004 = ~500ms to reach target, 0.02 = ~10ms to reach target
+		//PING + TIME sets varispeed inertia
+		// min = 1ms, 12 o'clock = ~250ms, max = 1000ms
 		if (flag_pot_changed_pingdown[TIME_POT*2+i])
 		{
 			float pot_val = (float)i_smoothed_potadc[TIME_POT*2+i] / 4095.0f;
-			// Map pot: min = fast (0.02, ~10ms), max = slow (0.0001, ~2000ms)
-			param[i][VARISPEED_INERTIA] = 0.02f - pot_val * pot_val * (0.02f - 0.0001f);
+			// Map pot: time_ms = 1 + 999 * pot^2, slew = 0.0833 / time_ms
+			float time_factor = 1.0f + 999.0f * pot_val * pot_val;
+			param[i][VARISPEED_INERTIA] = 0.0833f / time_factor;
 		}
 
 		if (flag_pot_changed_infdown[TIME_POT*2+i])

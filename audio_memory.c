@@ -35,6 +35,8 @@ extern const uint32_t LOOP_RAM_BASE[NUM_CHAN];
 
 extern uint8_t SAMPLESIZE;
 
+extern uint32_t target_read_addr[];
+
 // From looping_delay.c - address increment/decrement functions that handle REV mode
 extern uint32_t inc_addr(uint32_t addr, uint8_t channel);
 extern uint32_t dec_addr(uint32_t addr, uint8_t channel);
@@ -94,6 +96,12 @@ uint32_t memory_read_varispeed(uint32_t *addr, float *frac_pos, uint8_t channel,
 	float frac;
 
 	for (i = 0; i < num_samples; i++) {
+		// Advance target_read_addr at 1x speed (once per output sample)
+		if (decrement)
+			target_read_addr[channel] = dec_addr(target_read_addr[channel], channel);
+		else
+			target_read_addr[channel] = inc_addr(target_read_addr[channel], channel);
+
 		// Enforce valid addr range
 		if ((addr[channel] < SDRAM_BASE) || (addr[channel] > (SDRAM_BASE + SDRAM_SIZE)))
 			addr[channel] = SDRAM_BASE;

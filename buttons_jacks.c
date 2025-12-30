@@ -35,6 +35,7 @@
 #include "timekeeper.h"
 #include "audio_memory.h"
 #include "dig_pins.h"
+#include "flash_user.h"
 
 extern volatile uint32_t ping_tmr;
 
@@ -405,14 +406,25 @@ void INFREVBUTTONJACK_PINGBUT_IRQHandler(void)
 		}
 	}
 
-	// Ping button release: clear flag_pot_changed_pingdown flags
-	if (State[0]==0xf000)
+	// Ping button release: clear flag_pot_changed_pingdown flags and save if inertia was changed
+	// Note: PING uses inverted logic (pressed=0xe000, released=0xe001), so release pattern is 0xe00f
+	if (State[0]==0xe00f)
 	{
-		if (flag_pot_changed_pingdown[TIME_POT*2])
+		uint8_t inertia_changed = 0;
+		
+		if (flag_pot_changed_pingdown[TIME_POT*2]) {
 			flag_pot_changed_pingdown[TIME_POT*2]=0;
+			inertia_changed = 1;
+		}
 
-		if (flag_pot_changed_pingdown[TIME_POT*2+1])
+		if (flag_pot_changed_pingdown[TIME_POT*2+1]) {
 			flag_pot_changed_pingdown[TIME_POT*2+1]=0;
+			inertia_changed = 1;
+		}
+		
+		// Auto-save inertia to flash
+		if (inertia_changed)
+			save_flash_params();
 	}
 
 

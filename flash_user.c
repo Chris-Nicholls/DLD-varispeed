@@ -476,12 +476,12 @@ void read_all_params_from_FLASH(void)
 		flash_param_TRACKING_COMP_1 = 1.0;
 
 	flash_param_VARISPEED_INERTIA_0 = flash_read_word(FLASH_ADDR_VARISPEED_INERTIA_0);
-	if (flash_param_VARISPEED_INERTIA_0 < 0.0001 || flash_param_VARISPEED_INERTIA_0 > 0.02)
-		flash_param_VARISPEED_INERTIA_0 = 0.002;
+	if (flash_param_VARISPEED_INERTIA_0 < 0.00008 || flash_param_VARISPEED_INERTIA_0 > 0.09)
+		flash_param_VARISPEED_INERTIA_0 = 0.00083;
 
 	flash_param_VARISPEED_INERTIA_1 = flash_read_word(FLASH_ADDR_VARISPEED_INERTIA_1);
-	if (flash_param_VARISPEED_INERTIA_1 < 0.0001 || flash_param_VARISPEED_INERTIA_1 > 0.02)
-		flash_param_VARISPEED_INERTIA_1 = 0.002;
+	if (flash_param_VARISPEED_INERTIA_1 < 0.00008 || flash_param_VARISPEED_INERTIA_1 > 0.09)
+		flash_param_VARISPEED_INERTIA_1 = 0.00083;
 
 
 	flash_global_param_FAST_FADE_SAMPLES = flash_read_word(FLASH_ADDR_FAST_FADE_SAMPLES);
