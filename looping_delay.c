@@ -689,9 +689,15 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		int32_t buffer_samples = sz / 2;
 		float landing_speed = 1.0f + (float)distance_samples / (float)buffer_samples;
 		
-		// If landing speed is within our range, use it (precise landing)
-		// Otherwise, slew toward target speed (musical pitch change)
-		if (landing_speed >= 0.5f && landing_speed <= 2.0f) {
+		// Only use landing speed if:
+		// 1. We're actually catching up (distance > one buffer)
+		// 2. Landing speed is within our valid range
+		// Otherwise use normal 1.0 speed or slew toward target
+		if (distance_samples >= -buffer_samples && distance_samples <= buffer_samples) {
+			// Within one buffer - just use normal speed
+			read_speed[channel] = 1.0f;
+		} else if (landing_speed >= 0.5f && landing_speed <= 2.0f) {
+			// Can land exactly in one buffer
 			read_speed[channel] = landing_speed;
 		} else {
 			// Slew read_speed toward target_read_speed
