@@ -46,9 +46,9 @@
   *-----------------------------------------------------------------------------
   *        System Clock source                    | PLL (HSE)
   *-----------------------------------------------------------------------------
-  *        SYSCLK(Hz)                             | 168000000
+  *        SYSCLK(Hz)                             | 180000000
   *-----------------------------------------------------------------------------
-  *        HCLK(Hz)                               | 168000000
+  *        HCLK(Hz)                               | 180000000
   *-----------------------------------------------------------------------------
   *        AHB Prescaler                          | 1
   *-----------------------------------------------------------------------------
@@ -60,7 +60,7 @@
   *-----------------------------------------------------------------------------
   *        PLL_M                                  | 8
   *-----------------------------------------------------------------------------
-  *        PLL_N                                  | 336
+  *        PLL_N                                  | 360
   *-----------------------------------------------------------------------------
   *        PLL_P                                  | 2
   *-----------------------------------------------------------------------------
@@ -155,8 +155,14 @@
 /************************* PLL Parameters *************************************/
 /* PLL_VCO = (HSE_VALUE or HSI_VALUE / PLL_M) * PLL_N */
 #define PLL_M      8
-//#define PLL_N      360
-#define PLL_N      336
+/* Operating at 168 MHz. 175/180 MHz both reproducibly cause signal-
+ * proportional channel-1 clicks at the loop rate; root cause not isolated
+ * (ruled out: SDRAM refresh, SDRAM timing margin, FLASH wait-state margin,
+ * codec_BUFF_LEN sizing, reverb code, looping_delay code). Likely a
+ * hardware-level marginality at >168 MHz that we can't easily work around. */
+//#define PLL_N      360   /* 180 MHz — clicks */
+//#define PLL_N      350   /* 175 MHz — clicks */
+#define PLL_N      336     /* 168 MHz — stable */
 
 /* SYSCLK = PLL_VCO / PLL_P */
 #define PLL_P      2
@@ -190,8 +196,8 @@
   * @{
   */
 
-  uint32_t SystemCoreClock = 168000000;
-//  uint32_t SystemCoreClock = 180000000;
+  uint32_t SystemCoreClock = 180000000;
+//  uint32_t SystemCoreClock = 168000000;
 
   __I uint8_t AHBPrescTable[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 6, 7, 8, 9};
 
@@ -228,6 +234,26 @@ void SystemInit(void)
   /* FPU settings ------------------------------------------------------------*/
   #if (__FPU_PRESENT == 1) && (__FPU_USED == 1)
     SCB->CPACR |= ((3UL << 10*2)|(3UL << 11*2));  /* set CP10 and CP11 Full Access */
+    __DSB();
+    __ISB();
+    /* Enable Flush-To-Zero in FPSCR. Without this, denormal floats (any |x| <
+     * 1.18e-38) take ~50 cycles per FPU op vs 1 cycle for normals, because
+     * the M4 FPU traps denormals to software emulation. Our reverb's IIR
+     * feedback paths (recirc damping LPF state, biquad state, morph state)
+     * decay exponentially toward zero during silence — those decaying values
+     * land in the denormal range and stall the FPU. Enough stalls in one
+     * audio block push the ISR past its 666 µs deadline; the DMA RX buffer
+     * then partially overruns, causing L-channel data to land in some R-
+     * channel slot positions. That swap shows up later as `auxin` containing
+     * input audio, which then writes to the delay buffer via `wr` and plays
+     * back through `rd`. FZ flushes denormals to zero, keeping every FPU op
+     * single-cycle and the ISR within budget. */
+    __asm volatile (
+        "vmrs r0, fpscr\n"
+        "orr  r0, r0, #(1 << 24)\n"   /* FZ = bit 24 */
+        "vmsr fpscr, r0\n"
+        ::: "r0"
+    );
   #endif
   /* Reset the RCC clock configuration to the default reset state ------------*/
   /* Set HSION bit */
@@ -384,7 +410,7 @@ static void SetSysClock(void)
 
   if (HSEStatus == (uint32_t)0x01)
   {
-    /* Select regulator voltage output Scale 1 mode, System frequency up to 168 MHz */
+    /* Select regulator voltage output Scale 1 mode (required for 180 MHz with over-drive) */
     RCC->APB1ENR |= RCC_APB1ENR_PWREN;
     PWR->CR |= PWR_CR_VOS;
 
@@ -409,8 +435,23 @@ static void SetSysClock(void)
     {
     }
    
-    /* Configure Flash prefetch, Instruction cache, Data cache and wait state */
-    FLASH->ACR = FLASH_ACR_ICEN |FLASH_ACR_DCEN |FLASH_ACR_LATENCY_5WS;
+    /* Enable the Over-drive to reach 180 MHz on STM32F427/437.  Must be
+       done after the main PLL is locked but before switching SYSCLK to
+       it.  Scale 1 alone tops out at 168 MHz; over-drive lifts it to 180. */
+    PWR->CR |= PWR_CR_ODEN;
+    while((PWR->CSR & PWR_CSR_ODRDY) == 0)
+    {
+    }
+    PWR->CR |= PWR_CR_ODSWEN;
+    while((PWR->CSR & PWR_CSR_ODSWRDY) == 0)
+    {
+    }
+
+    /* Configure Flash prefetch, Instruction cache, Data cache and wait state.
+     * 5WS is correct for 168 MHz. PRFTEN reverted — added during the 180 MHz
+     * investigation, may interact poorly with ART/I-cache at 168 (suspected
+     * cause of clicks returning after the investigation). HEAD had it off. */
+    FLASH->ACR = FLASH_ACR_ICEN | FLASH_ACR_DCEN | FLASH_ACR_LATENCY_5WS;
 
     /* Select the main PLL as system clock source */
     RCC->CFGR &= (uint32_t)((uint32_t)~(RCC_CFGR_SW));

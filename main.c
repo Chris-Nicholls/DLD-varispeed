@@ -43,6 +43,7 @@
 #include "dig_pins.h"
 #include "codec_CS4271.h"
 #include "RAM_test.h"
+#include "velvet_reverb.h"
 
 
 uint32_t g_error=0;
@@ -117,7 +118,6 @@ int main(void)
 
 	if (RAMTEST_BUTTONS) RAM_startup_test();
 
-	init_LED_PWM_IRQ();
 
 	audio_buffer_init();
 
@@ -165,12 +165,20 @@ int main(void)
     }
 
 	init_inputread_timer();
+	init_LED_PWM_IRQ();
+
+#ifdef REVERB_ENABLE
+	velvet_reverb_init();
+#endif
 
 	Start_I2SDMA_Channel1();
 	Start_I2SDMA_Channel2();
 
 	while(1){
 
+#ifdef REVERB_ENABLE
+		velvet_reverb_poll();
+#endif
 
 		if (global_mode[QUANTIZE_MODE_CHANGES]==0)
 		{

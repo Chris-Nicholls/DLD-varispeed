@@ -43,7 +43,7 @@ extern uint8_t global_mode[NUM_GLOBAL_MODES];
 extern float global_param[NUM_GLOBAL_PARAMS];
 
 
-extern uint8_t loop_led_state[NUM_CHAN];
+#include "leds.h"   /* set_loop_led + loop_led_state extern */
 
 extern uint8_t flag_inf_change[2];
 extern uint8_t flag_rev_change[2];
@@ -631,20 +631,20 @@ void update_system_settings_leds(void)
 
 		if (led_flasher < TRIG_CNTS)
 		{
-			loop_led_state[0]=1;
+			set_loop_led(0, 1);
 			LED_PINGBUT_OFF;
-			loop_led_state[1]=0;
+			set_loop_led(1, 0);
 		}
 		else if (led_flasher < GATE_CNTS)
 		{
 			if (mode[0][LOOP_CLOCK_GATETRIG]==TRIG_MODE)
-				loop_led_state[0]=0;
+				set_loop_led(0, 0);
 		}
 		else if (led_flasher < (GATE_CNTS + TRIG_CNTS))
 		{
-			loop_led_state[0]=0;
+			set_loop_led(0, 0);
 			LED_PINGBUT_ON;
-			loop_led_state[1]=0;
+			set_loop_led(1, 0);
 		}
 		else if (led_flasher < (GATE_CNTS*2))
 		{
@@ -653,14 +653,14 @@ void update_system_settings_leds(void)
 		}
 		else if (led_flasher < ((GATE_CNTS*2) + TRIG_CNTS))
 		{
-			loop_led_state[0]=0;
+			set_loop_led(0, 0);
 			LED_PINGBUT_OFF;
-			loop_led_state[1]=1;
+			set_loop_led(1, 1);
 		}
 		else if (led_flasher < (GATE_CNTS*3))
 		{
 			if (mode[1][LOOP_CLOCK_GATETRIG]==TRIG_MODE)
-				loop_led_state[1]=0;
+				set_loop_led(1, 0);
 		}
 		else
 			led_flasher=0;
@@ -672,7 +672,7 @@ void update_system_settings_leds(void)
 		{
 			old_slow_fade = global_param[SLOW_FADE_SAMPLES];
 			//force reset
-			loop_led_state[0] = 1;
+			set_loop_led(0, 1);
 			pulse_ctr[0] = 0;
 			flashes_ctr[0] = 0;
 		}
@@ -681,7 +681,7 @@ void update_system_settings_leds(void)
 			pulse_ctr[0]--;
 		else
 		{
-			loop_led_state[0]=1-loop_led_state[0];
+			set_loop_led(0, !loop_led_state[0]);
 
 			if (flashes_ctr[0])
 			{
@@ -690,7 +690,7 @@ void update_system_settings_leds(void)
 			}
 			else
 			{
-				loop_led_state[0] = 0;
+				set_loop_led(0, 0);
 				pulse_ctr[0] = 1000;
 				if (global_param[SLOW_FADE_SAMPLES]==0) flashes_ctr[0] = 1;
 				else if (global_param[SLOW_FADE_SAMPLES]==196) flashes_ctr[0] = 3;
@@ -705,7 +705,7 @@ void update_system_settings_leds(void)
 			{
 				old_ping_method = global_mode[PING_METHOD];
 				//force reset
-				loop_led_state[1] = 1;
+				set_loop_led(1, 1);
 				pulse_ctr[1] = 0;
 				flashes_ctr[1] = 0;
 			}
@@ -714,7 +714,7 @@ void update_system_settings_leds(void)
 				pulse_ctr[1]--;
 			else
 			{
-				loop_led_state[1]=1-loop_led_state[1];
+				set_loop_led(1, !loop_led_state[1]);
 
 				if (flashes_ctr[1])
 				{
@@ -734,8 +734,8 @@ void update_system_settings_leds(void)
 	}
 	else
 	{
-		loop_led_state[0]=0;
-		loop_led_state[1]=0;
+		set_loop_led(0, 0);
+		set_loop_led(1, 0);
 		LED_PINGBUT_OFF;
 
 	}

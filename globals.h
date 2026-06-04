@@ -33,7 +33,12 @@
 //codec_BUFF_LEN = Size (in samples) of the DMA rx/tx buffers:
 //Each channel = codec_BUFF_LEN/2 samples
 //We process the rx buffer when it's half-full and 100% full, so codec_BUFF_LEN/4 samples are processed at one time
-#define codec_BUFF_LEN 32
+//
+//At 128: ISR fires every 667 µs (32 stereo frames per call) instead of 83 µs (4 per call).
+//Same total CPU per second, but the reverb sees ~2 ISR preemptions per block instead of
+//~8 — drops peak/variance and the LED/TIM10 preemption-stretch that was dominating
+//wall-clock cost. Input latency rises 83→667 µs (~14 ms total worst-case).
+#define codec_BUFF_LEN 128
 
 #define FW_VERSION 5
 

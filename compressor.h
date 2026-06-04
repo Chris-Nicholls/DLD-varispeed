@@ -43,8 +43,21 @@
 
 #define C_THRESHOLD_75_32BIT 864691128455135232
 
-int32_t compress(int32_t val);
+extern float MAX_SAMPLEVAL;
+extern float THRESHOLD_COMPILED;
+extern int32_t THRESHOLD_VALUE;
 
 void init_compressor(uint32_t max_sample_val, float threshold_percent);
+
+/* Inlined here so the compiler can fold it into the audio inner loop and
+ * avoid the per-call VPUSH/VPOP for FPU caller-saves.  Body unchanged from
+ * the previous compressor.c implementation. */
+static inline int32_t compress(int32_t val)
+{
+	float tv = THRESHOLD_COMPILED / ((float)val);
+	if (val > THRESHOLD_VALUE) return (MAX_SAMPLEVAL - tv);
+	else if (val < -THRESHOLD_VALUE) return (-MAX_SAMPLEVAL - tv);
+	else return val;
+}
 
 #endif /* COMPRESSOR_H_ */

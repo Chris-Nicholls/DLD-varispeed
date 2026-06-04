@@ -47,7 +47,7 @@ extern volatile int16_t ch2rx_buffer[codec_BUFF_LEN];
 
 extern uint8_t global_mode[NUM_GLOBAL_MODES];
 
-extern uint8_t loop_led_state[NUM_CHAN];
+#include "leds.h"   /* set_loop_led + loop_led_state extern */
 
 
 void set_default_calibration_values(void)
@@ -164,8 +164,8 @@ void update_calibrate_leds(void)
 	static uint32_t led_flasher=0;
 
 	led_flasher+=UINT32_MAX/1665;
-	loop_led_state[(led_flasher < UINT32_MAX/2)?1:0] = 0;
-	loop_led_state[(led_flasher < UINT32_MAX/2)?0:1] = 1;
+	set_loop_led((led_flasher < UINT32_MAX/2)?1:0, 0);
+	set_loop_led((led_flasher < UINT32_MAX/2)?0:1, 1);
 
 }
 

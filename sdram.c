@@ -92,7 +92,7 @@ void SDRAM_Init(void)
 	FMC_Bank5_6->SDCR[1] = FMC_SDCR1_NR_1 | FMC_SDCR1_NC_0 | FMC_SDCR1_MWID_0 | FMC_SDCR1_NB | FMC_SDCR1_CAS;
 
 	// Initialization step 2
-	// Timing characteristics, expressed in number of clock cycles (@180MHz, SDCLK is HCLK/2 means a value of 1 = 11.1ns, 2 = 22.2ns etc..)
+	// Timing characteristics, expressed in number of clock cycles (@168MHz, SDCLK is HCLK/2 means a value of 1 = 11.9ns, 2 = 23.8ns etc..)
 	FMC_Bank5_6->SDTR[0] = TRC(6)  | TRP(2);
 	FMC_Bank5_6->SDTR[1] = TMRD(2) | TXSR(6) | TRAS(4) | TWR(2) | TRCD(2);
 
@@ -134,9 +134,9 @@ void SDRAM_Init(void)
 	// Initialization step 8
 	while(FMC_Bank5_6->SDSR & FMC_SDSR_BUSY);
 
-	// refresh rate in number of SDCLK clock cycles between the refresh cycles
-	// 683 = 7.6uS x 90Mhz
-	// 7.6uS x 8196 rows = 62ms refresh rate
+	// Refresh rate in number of SDCLK cycles between refreshes.
+	// Target: 64 ms / 8192 rows = 7.81 µs per row.
+	// At 84 MHz SDCLK (168 MHz HCLK): 7.81 µs × 84 = 656 → use 663 (matches HEAD).
 	FMC_Bank5_6->SDRTR |= (663 << 1);
 
 

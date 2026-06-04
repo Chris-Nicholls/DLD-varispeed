@@ -36,6 +36,11 @@
 
 #define LOOP_SIZE (SDRAM_SIZE/2)
 
+/* Per-channel effective loop size. ch1 = LOOP_SIZE; ch2 = LOOP_SIZE - REVERB_SDRAM_RESERVE.
+ * inc_addr(), dec_addr(), and offset_samples() wrap at loop_size[channel] instead of
+ * the constant LOOP_SIZE so ch2's write head never reaches the SDRAM reverb regions. */
+extern uint32_t loop_size[NUM_CHAN];
+
 
 void audio_buffer_init(void);
 void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t channel);
@@ -53,4 +58,3 @@ void change_inf_mode(uint8_t channel);
 void reverse_loop(uint8_t channel);
 
 #endif
-

@@ -38,6 +38,7 @@
 #include "exp_1voct.h"
 #include "timekeeper.h"
 #include "looping_delay.h"
+#include "velvet_reverb.h"
 #include "log_taper_padded.h"
 
 extern const float log_taper[4096];
@@ -472,18 +473,27 @@ void update_params(void)
 				t_combined = i_smoothed_potadc[LEVEL_POT*2+channel];
 			}
 
-			if (global_mode[LOG_DELAY_FEED])
-				param[channel][LEVEL] = log_taper[t_combined];
+			/* Only channel 0 writes param[][LEVEL] from pot/CV. Channel 1's
+			 * LEVEL is slaved from channel 0 at the end of update_params.
+			 * If channel 1 also wrote here, the window between this write
+			 * and the slaving would let the audio ISR read channel 1's
+			 * value as the RIGHT LEVEL pot's value (which is repurposed as
+			 * the density macro) — causing input audio to leak through
+			 * mainin_atten when density > 0. */
+			if (channel == 0) {
+				if (global_mode[LOG_DELAY_FEED])
+					param[channel][LEVEL] = log_taper[t_combined];
 
-			else {
-				if (t_combined<30.0)
-					param[channel][LEVEL] = 0.0;
+				else {
+					if (t_combined<30.0)
+						param[channel][LEVEL] = 0.0;
 
-				else if (t_combined<4066.0)
-					param[channel][LEVEL] = (t_combined - 30.0)/4066.0;
+					else if (t_combined<4066.0)
+						param[channel][LEVEL] = (t_combined - 30.0)/4066.0;
 
-				else
-					param[channel][LEVEL] = 1.0;
+					else
+						param[channel][LEVEL] = 1.0;
+				}
 			}
 
 
@@ -513,7 +523,9 @@ void update_params(void)
 			else if ((temp_f<1.003) && (temp_f>0.997))
 				temp_f = 1.0;
 
-			param[channel][REGEN] = temp_f;
+			/* Same race-avoidance reasoning as LEVEL above. */
+			if (channel == 0)
+				param[channel][REGEN] = temp_f;
 
 
 		}
@@ -522,8 +534,10 @@ void update_params(void)
 
 // *******  INF ON **********
 
-			param[channel][LEVEL]=0.0;
-			param[channel][REGEN]=1.0;
+			if (channel == 0) {
+				param[channel][LEVEL]=0.0;
+				param[channel][REGEN]=1.0;
+			}
 
 // ********* WINDOW *********
 			//
@@ -569,9 +583,72 @@ void update_params(void)
 			t_combined = i_smoothed_potadc[MIX_POT*2+channel];
 		}
 
-		param[channel][MIX_DRY]=epp_lut[t_combined];
-		param[channel][MIX_WET]=epp_lut[4095 - t_combined];
+		/* Same race-avoidance: param[1][MIX_DRY/MIX_WET] is slaved from
+		 * channel 0 below, not from the right MIX pot. The right MIX pot's
+		 * wet value is captured into reverb_send separately. */
+		if (channel == 0) {
+			param[channel][MIX_DRY]=epp_lut[t_combined];
+			param[channel][MIX_WET]=epp_lut[4095 - t_combined];
+		}
 
+	}
+
+	/* ===================================================================
+	 * Reverb macro wiring + mix split
+	 *
+	 * Right channel's LEVEL / REGEN pots+CVs are repurposed for Density /
+	 * Decay macros. Left channel's LEVEL / REGEN mirror to the right so
+	 * both delay channels are slaved to one set of knobs.
+	 *
+	 * Mix split (per user request):
+	 *   Left  MIX → delay internal dry/wet (both delay channels track this)
+	 *   Right MIX → reverb SEND amount (scales the input feeding the reverb;
+	 *               the reverb output is always mixed in unscaled).
+	 *               Equal-power LUT — same curve as before, but now applied
+	 *               to the input side of the reverb rather than crossfading
+	 *               its output.
+	 *
+	 * Capture reverb_send from param[1][MIX_WET] BEFORE we slave param[1]'s
+	 * MIX_DRY/WET to param[0].
+	 * =================================================================== */
+	{
+		int32_t t;
+
+		/* Right LEVEL → Density macro */
+		t = (int32_t)i_smoothed_potadc[LEVEL_POT*2+1] + (int32_t)i_smoothed_cvadc[LEVEL*2+1];
+		if (t < 0) t = 0;
+		if (t > 4095) t = 4095;
+		velvet_reverb_apply_density_macro((float)t * (1.0f / 4095.0f));
+
+		/* Right REGEN → Decay macro */
+		t = (int32_t)i_smoothed_potadc[REGEN_POT*2+1] + (int32_t)i_smoothed_cvadc[REGEN*2+1];
+		if (t < 0) t = 0;
+		if (t > 4095) t = 4095;
+		velvet_reverb_apply_decay_macro((float)t * (1.0f / 4095.0f));
+
+		/* Right MIX → reverb send. Computed directly from the right MIX
+		 * pot (+ LEVEL CV if LEVELCV_IS_MIX is set, mirroring the standard
+		 * MIX logic above). NOT via param[1][MIX_WET] which is now slaved
+		 * from channel 0, not from the right pot. */
+		if (mode[1][LEVELCV_IS_MIX]) {
+			t = (int32_t)i_smoothed_potadc[MIX_POT*2+1] + (int32_t)i_smoothed_cvadc[LEVEL*2+1];
+			asm("usat %[dst], #12, %[src]" : [dst] "=r" (t) : [src] "r" (t));
+		} else {
+			t = (int32_t)i_smoothed_potadc[MIX_POT*2+1];
+			if (t < 0) t = 0;
+			if (t > 4095) t = 4095;
+		}
+		reverb_send = epp_lut[4095 - t];
+
+		/* Left LEVEL / REGEN / MIX drive both delay channels. With the
+		 * loop body's writes to param[1] guarded out, this slaving is the
+		 * ONLY place param[1][LEVEL/REGEN/MIX_DRY/MIX_WET] gets set — no
+		 * intermediate window where it holds right-pot values that would
+		 * leak through the audio ISR. */
+		param[1][LEVEL]   = param[0][LEVEL];
+		param[1][REGEN]   = param[0][REGEN];
+		param[1][MIX_DRY] = param[0][MIX_DRY];
+		param[1][MIX_WET] = param[0][MIX_WET];
 	}
 }
 

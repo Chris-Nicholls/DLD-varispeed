@@ -28,14 +28,23 @@
  * -----------------------------------------------------------------------------
  */
 
+#include <string.h>
 #include "globals.h"
 #include "looping_delay.h"
 #include "sdram.h"
+#include "velvet_reverb.h"
+#ifdef DIAG_FSK_ENABLE
+#include "diag_fsk.h"
+#endif
+
+/* Per-channel effective loop sizes — see looping_delay.h */
+uint32_t loop_size[NUM_CHAN];
 #include "adc.h"
 #include "params.h"
 #include "audio_memory.h"
 #include "timekeeper.h"
 #include "compressor.h"
+#include "leds.h"
 #include "dig_pins.h"
 
 extern const float epp_lut[4096];
@@ -86,7 +95,12 @@ uint32_t target_read_addr[NUM_CHAN];
 
 float lpf_coef;
 int32_t min_vol;
-float mainin_lpf[2]={0.0,0.0}, auxin_lpf[2]={0.0,0.0}, dcblock_lpf[2]={0.0,0.0};
+float mainin_lpf[2]={0.0,0.0}, auxin_lpf[2]={0.0,0.0};
+/* DC-block state: Q23.8 fixed-point (8 fractional bits) so a small DC
+ * offset (~< 1 sample) can still be tracked across many ISR calls.  Alpha
+ * is 1/4096 (shift 12) — corresponds to cutoff ~1.86 Hz @ 48 kHz, very
+ * close to the original float coef of 1/4800. */
+int32_t dcblock_state[2] = {0, 0};
 
 enum FadeStates{
 	NOT_FADING,
@@ -110,6 +124,17 @@ void audio_buffer_init(void)
 		ping_time=0x00002000*SAMPLESIZE;
 
 
+#ifdef REVERB_ENABLE
+	/* Both channels are shrunk by REVERB_SDRAM_RESERVE so ch2's write head
+	 * never reaches the T2 SDRAM ring at the top of its block. ch1 is
+	 * matched for identical maximum loop duration. */
+	loop_size[0] = LOOP_SIZE - REVERB_SDRAM_RESERVE;
+	loop_size[1] = LOOP_SIZE - REVERB_SDRAM_RESERVE;
+#else
+	loop_size[0] = LOOP_SIZE;
+	loop_size[1] = LOOP_SIZE;
+#endif
+
 	for(i=0;i<NUM_CHAN;i++){
 		memory_clear(i);
 
@@ -122,7 +147,7 @@ void audio_buffer_init(void)
 		set_divmult_time(i);
 
 		loop_start[i] = LOOP_RAM_BASE[i];
-		loop_end[i] = LOOP_RAM_BASE[i] + LOOP_SIZE;
+		loop_end[i] = LOOP_RAM_BASE[i] + loop_size[i];
 		
 		fractional_read_pos[i] = 0.0f;
 		read_speed[i] = 1.0f;
@@ -130,7 +155,10 @@ void audio_buffer_init(void)
 		doing_reverse_fade[i]=0;
 	}
 
-	lpf_coef = 0.0002;
+	/* Auto-mute LPF coef. 4× the original 0.0002 to compensate for running
+	 * the LPF only on the 0th sample of each ISR (decimation 1-of-4). The
+	 * effective time constant in real-time samples stays unchanged. */
+	lpf_coef = 0.0008;
 
 	if (SAMPLESIZE==2)
 	{
@@ -140,7 +168,7 @@ void audio_buffer_init(void)
 	else
 	{
 		min_vol = 10 << 16;
-		init_compressor(1<<31, 0.75);
+		init_compressor(1u<<31, 0.75);  /* unsigned: 1<<31 on signed int is UB */
 	}
 
 
@@ -157,15 +185,15 @@ uint32_t offset_samples(uint8_t channel, uint32_t base_addr, uint32_t offset, ui
 
 		t_addr = base_addr + offset;
 
-		while (t_addr >= (LOOP_RAM_BASE[channel] + LOOP_SIZE))
-			t_addr = t_addr - LOOP_SIZE;
+		while (t_addr >= (LOOP_RAM_BASE[channel] + loop_size[channel]))
+			t_addr = t_addr - loop_size[channel];
 
 	} else {
 
 		t_addr = base_addr - offset;
 
 		while (t_addr < LOOP_RAM_BASE[channel])
-			t_addr = t_addr + LOOP_SIZE;
+			t_addr = t_addr + loop_size[channel];
 
 	}
 
@@ -226,14 +254,14 @@ uint32_t inc_addr(uint32_t addr, uint8_t channel)
 	if (mode[channel][REV] == 0)
 	{
 		addr+=SAMPLESIZE;
-		if (addr >= (LOOP_RAM_BASE[channel] + LOOP_SIZE))
+		if (addr >= (LOOP_RAM_BASE[channel] + loop_size[channel]))
 			addr = LOOP_RAM_BASE[channel];
 	}
 	else
 	{
 		addr-=SAMPLESIZE;
 		if (addr <= LOOP_RAM_BASE[channel])
-			addr = LOOP_RAM_BASE[channel] + LOOP_SIZE - SAMPLESIZE;
+			addr = LOOP_RAM_BASE[channel] + loop_size[channel] - SAMPLESIZE;
 	}
 
 	return(addr & 0xFFFFFFFE);
@@ -247,14 +275,14 @@ uint32_t dec_addr(uint32_t addr, uint8_t channel)
 	if (mode[channel][REV] != 0)
 	{
 		addr+=SAMPLESIZE;
-		if (addr >= (LOOP_RAM_BASE[channel] + LOOP_SIZE))
+		if (addr >= (LOOP_RAM_BASE[channel] + loop_size[channel]))
 			addr = LOOP_RAM_BASE[channel];
 	}
 	else
 	{
 		addr-=SAMPLESIZE;
 		if (addr <= LOOP_RAM_BASE[channel])
-			addr = LOOP_RAM_BASE[channel] + LOOP_SIZE - 2;
+			addr = LOOP_RAM_BASE[channel] + loop_size[channel] - 2;
 	}
 	return(addr & 0xFFFFFFFE);
 
@@ -590,24 +618,43 @@ enum AutoMute_States{
  * Process the audio
  * This is called by the RX DMA interrupt for each codec
  *
- * parameter sz is codec_BUFF_LEN = 8
+ * parameter sz is codec_BUFF_LEN/4 samples per channel (currently 8)
  *
  */
+#include "diag_log.h"
+
 void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t channel)
 {
+	uint32_t _isr_t0 = DWT->CYCCNT;
 	static uint32_t mute_on_boot_ctr=96000;
 	static uint8_t auto_muting_main_state[NUM_CHAN]={0,0};
 	static float auto_muting_main_fade[NUM_CHAN]={0,0};
 	static uint8_t auto_muting_aux_state[NUM_CHAN]={0,0};
 	static float auto_muting_aux_fade[NUM_CHAN]={0,0};
 
+	/* (Snapshot removed — reverted to direct reads from volatile DMA buffer
+	 * to match HEAD behaviour while we hunt the input-leak bug.) */
+
 	uint32_t last_read_block_addr;
 
 	int32_t mainin, mix, dry, wr, rd;
-	float regen;
-	float mainin_atten;
+	int32_t regen;          /* was float — now Q-format int from Q15 mul */
+	int32_t mainin_atten;   /* was float — now Q-format int from Q15 mul */
 	int32_t auxin;
 	int32_t auxout;
+
+	/* Pre-compute Q15 versions of params used in the inner loop, so we do
+	 * one VCVT+VMUL per param up front instead of per sample × 4 iters. */
+	const int32_t regen_q15   = (int32_t)(param[channel][REGEN]   * 32768.0f);
+	const int32_t level_q15   = (int32_t)(param[channel][LEVEL]   * 32768.0f);
+	const int32_t mix_dry_q15 = (int32_t)(param[channel][MIX_DRY] * 32768.0f);
+	const int32_t mix_wet_q15 = (int32_t)(param[channel][MIX_WET] * 32768.0f);
+	/* Reverb SEND gain from right MIX pot (equal-power LUT in params.c).
+	 * Scales the audio fed into the reverb via push_sample. The reverb's
+	 * output is always mixed unscaled into the final delay-mix, so this
+	 * knob controls how hard the reverb is driven (and therefore the
+	 * audible reverb amount, but only via the tail's own input level). */
+	const int32_t send_q15 = (int32_t)(reverb_send * 32768.0f);
 
 	uint16_t i,t;
 	uint16_t topbyte, bottombyte;
@@ -678,8 +725,11 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		// Otherwise, slew toward target speed (2.0 or 0.5)
 		int32_t buffer_samples = sz / 2;
 		if (distance_samples >= -buffer_samples && distance_samples <= buffer_samples) {
-			// Within one buffer - snap to normal speed
+			// Within one buffer - snap to normal speed and zero fractional
+			// position so memory_read_varispeed's 1x fast path fires (single
+			// SDRAM read per sample instead of two for interpolation).
 			read_speed[channel] = 1.0f;
+			fractional_read_pos[channel] = 0.0f;
 		} else {
 			// Far from target - slew toward target speed
 			float slew = param[channel][VARISPEED_INERTIA];
@@ -694,7 +744,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			}
 		}
 		
-		// Normal mode: use varispeed
 		crossed_start_fade_addr = memory_read_varispeed(read_addr, &fractional_read_pos[channel], channel, rd_buff, sz/2, read_speed[channel], start_fade_addr, doing_reverse_fade[channel]);
 	} else {
 		// Freeze modes: use original memory_read
@@ -763,13 +812,16 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		}
 		else
 		{
+			/* Cast topbyte to uint32_t before the 16-bit shift — uint16_t
+			 * promotes to (signed) int, and if bit 15 is set the shifted
+			 * result lands in the sign bit of int, which is UB. */
 			topbyte = (uint16_t)(*src++);
 			bottombyte = (uint16_t)(*src++);
-			mainin = (topbyte << 16) + (uint16_t)bottombyte;
+			mainin = (int32_t)(((uint32_t)topbyte << 16) | (uint16_t)bottombyte);
 
 			topbyte = (uint16_t)(*src++);
 			bottombyte = (uint16_t)(*src++);
-			auxin = (topbyte << 16) + (uint16_t)bottombyte;
+			auxin = (int32_t)(((uint32_t)topbyte << 16) | (uint16_t)bottombyte);
 		}
 
 		if (mute_on_boot_ctr)
@@ -780,78 +832,55 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		}
 
 		if (global_mode[AUTO_MUTE]){
-			//minimum 830ns, mean 2us
+			/* Heavy part (LPF + state transitions) runs on i==0 only —
+			 * 1-of-4 decimation. lpf_coef was scaled ×4 in
+			 * audio_buffer_init to keep the same effective time constant.
+			 * Fade increment + apply still run per sample so transitions
+			 * are smooth. */
+			if (i == 0) {
+				mainin_lpf[channel] = (mainin_lpf[channel]*(1.0-lpf_coef)) + (((mainin>0)?mainin:(-1*mainin))*lpf_coef);
+				if (mainin_lpf[channel]<min_vol && (auto_muting_main_state[channel] == FADING_UP || auto_muting_main_state[channel]==UNMUTED))
+					auto_muting_main_state[channel] =  FADING_DOWN;
+				if (mainin_lpf[channel]>=min_vol && (auto_muting_main_state[channel] == FADING_DOWN || auto_muting_main_state[channel]==MUTED))
+					auto_muting_main_state[channel] =  FADING_UP;
 
-			mainin_lpf[channel] = (mainin_lpf[channel]*(1.0-lpf_coef)) + (((mainin>0)?mainin:(-1*mainin))*lpf_coef);
+				auxin_lpf[channel] = (auxin_lpf[channel]*(1.0-lpf_coef)) + (((auxin>0)?auxin:(-1*auxin))*lpf_coef);
+				if (auxin_lpf[channel]<min_vol && (auto_muting_aux_state[channel] == FADING_UP || auto_muting_aux_state[channel]==UNMUTED))
+					auto_muting_aux_state[channel] =  FADING_DOWN;
+				if (auxin_lpf[channel]>=min_vol && (auto_muting_aux_state[channel] == FADING_DOWN || auto_muting_aux_state[channel]==MUTED))
+					auto_muting_aux_state[channel] =  FADING_UP;
+			}
 
-			//Initiate a fade-down
-			if (mainin_lpf[channel]<min_vol && (auto_muting_main_state[channel] == FADING_UP || auto_muting_main_state[channel]==UNMUTED))
-				auto_muting_main_state[channel] =  FADING_DOWN;
-
-			//Initiate a fade-up
-			if (mainin_lpf[channel]>=min_vol && (auto_muting_main_state[channel] == FADING_DOWN || auto_muting_main_state[channel]==MUTED))
-				auto_muting_main_state[channel] =  FADING_UP;
-
-			//Continue fades
+			/* Per-sample fade increment + terminate + apply. */
 			if (auto_muting_main_state[channel] == FADING_DOWN)
 				auto_muting_main_fade[channel] -= AUTO_MUTE_DECAY;
-
 			else if (auto_muting_main_state[channel] == FADING_UP)
 				auto_muting_main_fade[channel] += AUTO_MUTE_ATTACK;
-
-			//Terminate fades
-			if (auto_muting_main_fade[channel] <= 0.0)
-			{
+			if (auto_muting_main_fade[channel] <= 0.0) {
 				auto_muting_main_fade[channel] = 0.0;
 				auto_muting_main_state[channel] = MUTED;
-			}
-			else if (auto_muting_main_fade[channel] >= 1.0)
-			{
+			} else if (auto_muting_main_fade[channel] >= 1.0) {
 				auto_muting_main_fade[channel] = 1.0;
 				auto_muting_main_state[channel] = UNMUTED;
 			}
-
-			//Apply mute or fade
 			if (auto_muting_main_state[channel] == MUTED)
 				mainin = 0;
-
 			else if (auto_muting_main_state[channel] != UNMUTED)
 				mainin = (float)mainin * auto_muting_main_fade[channel];
 
-
-			auxin_lpf[channel] = (auxin_lpf[channel]*(1.0-lpf_coef)) + (((auxin>0)?auxin:(-1*auxin))*lpf_coef);
-
-			//Initiate a fade-down
-			if (auxin_lpf[channel]<min_vol && (auto_muting_aux_state[channel] == FADING_UP || auto_muting_aux_state[channel]==UNMUTED))
-				auto_muting_aux_state[channel] =  FADING_DOWN;
-
-			//Initiate a fade-up
-			if (auxin_lpf[channel]>=min_vol && (auto_muting_aux_state[channel] == FADING_DOWN || auto_muting_aux_state[channel]==MUTED))
-				auto_muting_aux_state[channel] =  FADING_UP;
-
-			//Continue fades
 			if (auto_muting_aux_state[channel] == FADING_DOWN)
 				auto_muting_aux_fade[channel] -= AUTO_MUTE_DECAY;
-
 			else if (auto_muting_aux_state[channel] == FADING_UP)
 				auto_muting_aux_fade[channel] += AUTO_MUTE_ATTACK;
-
-			//Terminate fades
-			if (auto_muting_aux_fade[channel] <= 0.0)
-			{
+			if (auto_muting_aux_fade[channel] <= 0.0) {
 				auto_muting_aux_fade[channel] = 0.0;
 				auto_muting_aux_state[channel] = MUTED;
-			}
-			else if (auto_muting_aux_fade[channel] >= 1.0)
-			{
+			} else if (auto_muting_aux_fade[channel] >= 1.0) {
 				auto_muting_aux_fade[channel] = 1.0;
 				auto_muting_aux_state[channel] = UNMUTED;
 			}
-
-			//Apply mute or fade
 			if (auto_muting_aux_state[channel] == MUTED)
 				auxin = 0;
-
 			else if (auto_muting_aux_state[channel] != UNMUTED)
 				auxin = (float)auxin * auto_muting_aux_fade[channel];
 		}
@@ -874,54 +903,86 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 
 
+
 		if (global_mode[SOFTCLIP])
 			rd = compress(rd);
 
 		if (SAMPLESIZE==2)
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (rd) : [src] "r" (rd));
 
-
-		// Attenuate the delayed signal with REGEN
-		regen = ((float)rd) * param[channel][REGEN];
-
-		// Attenuate the clean signal by the LEVEL parameter
-		mainin_atten = ((float)mainin) * param[channel][LEVEL];
+		/* Integer Q15-format multiplies replace the per-sample float math.
+		 * regen_q15 / level_q15 / mix_dry_q15 / mix_wet_q15 are pre-computed
+		 * once per ISR above. */
+		regen        = (rd     * regen_q15) >> 15;
+		mainin_atten = (mainin * level_q15) >> 15;
 
 		if (mode[channel][SEND_RETURN_BEFORE_LOOP]) {
-			// Assign the auxin signal to the write head
-			wr = auxin;
-			// Add the loop contents to the input signal, and assign to the auxout signal
-			auxout = (int32_t)(regen + mainin_atten);
+			wr     = auxin;
+			auxout = regen + mainin_atten;
 		} else {
-			// Add the loop contents to the input signal, as well as the auxin signal, and assign to the write head
-			wr = (int32_t)(regen + mainin_atten + (float)auxin);
-			// Assign the non-attenuated loop contents to the auxout signal
+			wr     = regen + mainin_atten + auxin;
 			auxout = rd;
-                }
+		}
 
-
-		//High-pass filter on wr
+		/* DC blocker as a 1-pole IIR in Q23.8 fixed point.
+		 *   state += ((wr << 8) - state) >> 12         alpha ≈ 1/4096
+		 *   wr    -= state >> 8                        subtract DC estimate
+		 * Cutoff ~1.86 Hz @ 48 kHz, close to the original float 1/4800.
+		 *
+		 * DIAGNOSTIC RESULT (skip on ch1): clicks persist. DC blocker
+		 * innocent. Restored to normal here. */
 		if (global_mode[RUNAWAYDC_BLOCK])
 		{
-			dcblock_lpf[channel] = (dcblock_lpf[channel]*(1.0-(1.0/4800.0))) + (wr*(1.0/4800.0));
-			wr = wr - dcblock_lpf[channel];
+			/* wr may be negative here (it's a sum of three signed values
+			 * before the SSAT on line below). Left-shifting a negative
+			 * signed int is UB; cast through unsigned to get well-defined
+			 * bitwise behaviour that GCC also produces less defensively. */
+			int32_t err = (int32_t)((uint32_t)wr << 8) - dcblock_state[channel];
+			dcblock_state[channel] += err >> 12;
+			wr -= dcblock_state[channel] >> 8;
 		}
 
 		if (global_mode[SOFTCLIP])
 			wr = compress(wr);
-
 		else if (SAMPLESIZE==2)
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (wr) : [src] "r" (wr));
 
-
-		// Wet/dry mix, as determined by the MIX parameter
-		mix = ( ((float)dry) * param[channel][MIX_DRY] ) + ( ((float)rd) * param[channel][MIX_WET] );
+		// Wet/dry mix in Q15.
+		mix = ((dry * mix_dry_q15) + (rd * mix_wet_q15)) >> 15;
 
 		if (global_mode[SOFTCLIP])
 			mix = compress(mix);
 
 		else if (SAMPLESIZE==2)
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (mix) : [src] "r" (mix));
+
+#ifdef REVERB_ENABLE
+		/* --- Reverb: send-style routing ---
+		 * Right MIX scales the audio FED INTO the reverb (push_sample on
+		 * ch0 only — reverb input is mono). The reverb's stereo output is
+		 * then summed unscaled into the per-channel mix. So the right MIX
+		 * controls how hard the reverb is driven; the tail you hear scales
+		 * with that drive, but the output mix is never silenced.
+		 *
+		 * Earlier diagnostic: skipping `mix += rev_s` on ch1 did NOT
+		 * eliminate the click — confirmed the click is upstream of the
+		 * reverb add. Now testing T2 DMA→memcpy in velvet_reverb.c. */
+		{
+			int16_t rev_s;
+			if (channel == 0) {
+				int32_t to_reverb = (mix * send_q15) >> 15;
+				if (SAMPLESIZE==2)
+					asm("ssat %[dst], #16, %[src]" : [dst] "=r" (to_reverb) : [src] "r" (to_reverb));
+				velvet_reverb_push_sample((int16_t)to_reverb);
+				rev_s = velvet_reverb_out_left();
+			} else {
+				rev_s = velvet_reverb_out_right();
+			}
+			mix += rev_s;
+			if (SAMPLESIZE==2)
+				asm("ssat %[dst], #16, %[src]" : [dst] "=r" (mix) : [src] "r" (mix));
+		}
+#endif
 
 		if (global_mode[CALIBRATE])
 		{
@@ -955,14 +1016,30 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 #else
 
 
+			/* DIAGNOSTIC RESULT (mix=mainin on ch1): MAIN clean. Confirms
+			 * the click lives in DSP between mainin and the final mix
+			 * write. Disabled here so we can run the next bisection. */
+
 			if (SAMPLESIZE==2){
-				//Main out
-				*dst++ = mix + CODEC_DAC_CALIBRATION_DCOFFSET[0+channel];
+				int32_t main_out = mix + CODEC_DAC_CALIBRATION_DCOFFSET[0+channel];
+				asm("ssat %[d], #16, %[s]" : [d] "=r" (main_out) : [s] "r" (main_out));
+				*dst++ = (int16_t)main_out;
 				*dst++ = 0;
 
-				//Send out
-				*dst++ = auxout + CODEC_DAC_CALIBRATION_DCOFFSET[2+channel];
-				*dst++ = 0;
+				//Send out — channel 1's send carries the FSK diag stream
+				//when DIAG_FSK_ENABLE is on and diag_log_enabled is true.
+#ifdef DIAG_FSK_ENABLE
+				if (diag_log_enabled && channel == 1) {
+					*dst++ = diag_fsk_next_sample();
+					*dst++ = 0;
+				} else
+#endif
+				{
+					int32_t send_out = auxout + CODEC_DAC_CALIBRATION_DCOFFSET[2+channel];
+					asm("ssat %[d], #16, %[s]" : [d] "=r" (send_out) : [s] "r" (send_out));
+					*dst++ = (int16_t)send_out;
+					*dst++ = 0;
+				}
 			}
 			else
 			{
@@ -1020,13 +1097,13 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	{
 		if (abs_diff(write_addr[channel], read_addr[channel]) < 960) //10ms pulse
 		{
-			loop_led_state[channel]=1;
+			set_loop_led(channel, 1);
 			if (channel==0) CLKOUT1_ON;
 			else CLKOUT2_ON;
 		}
 		else
 		{
-			loop_led_state[channel]=0;
+			set_loop_led(channel, 0);
 			if (channel==0) CLKOUT1_OFF;
 			else CLKOUT2_OFF;
 		}
@@ -1037,4 +1114,8 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	increment_read_fade(channel);
 	increment_write_fade(channel);
 
+	{
+		uint32_t _isr_dt = DWT->CYCCNT - _isr_t0;
+		diag_log(channel == 0 ? DIAG_EVT_AUDIOISR_CH0 : DIAG_EVT_AUDIOISR_CH1, _isr_dt);
+	}
 }

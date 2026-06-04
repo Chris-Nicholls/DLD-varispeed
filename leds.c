@@ -182,7 +182,7 @@ void update_channel_leds(void)
 			else if (loopled_tmr[channel] >= (divmult_time[channel]>>1))
 			{
 
-				loop_led_state[channel]=0;
+				set_loop_led(channel, 0);
 
 				if (channel==0) {
 					CLKOUT1_OFF;
@@ -269,8 +269,11 @@ void init_LED_PWM_IRQ(void)
 	NVIC_Init(&nvic);
 
 	TIM_TimeBaseStructInit(&tim);
-//	tim.TIM_Period = 17500; //168MHz / 2 / 17500 = 4.8kHz (208.3us) ... / 32 =
-	tim.TIM_Period = 4375; //168MHz / 2 / 4375 = 19.2kHz
+	/* APB1 timer clock = HCLK = 180 MHz (APB1 div 4 → 45, ×2 since div != 1
+	 * → 90 MHz; wait, actually APB1 timer is APB1×2 when PCLK1 prescaler != 1,
+	 * giving 90 MHz). Period 4688 → 4688/90e6 ≈ 52 µs ≈ 19.2 kHz. Same rate
+	 * as 168 MHz config (period 4375 / 84 MHz = 19.2 kHz). */
+	tim.TIM_Period = 4688;
 	tim.TIM_Prescaler = 0;
 	tim.TIM_ClockDivision = 0;
 	tim.TIM_CounterMode = TIM_CounterMode_Up;
@@ -280,32 +283,28 @@ void init_LED_PWM_IRQ(void)
 	TIM_Cmd(LED_TIM, ENABLE);
 }
 
-
-
-//runs @ 208uS (4.8kHz), with 32 steps => 6.6ms PWM period = 150Hz
+/* 19.2 kHz PWM driving both loop LEDs. The 32-step counter gives a ~600 Hz
+ * PWM-cycle frequency, well above the click rate (4–6 Hz at loop tempo).
+ * Restored after observation that removing this caused channel-1 audio
+ * clicks at the loop rate — apparently the slow GPIO edges at the loop
+ * rate were coupling into codec B's analog output. */
 void LED_PWM_IRQHandler(void)
 {
-	static uint32_t loop_led_PWM_ctr=0;
+	static uint32_t loop_led_PWM_ctr = 0;
 	if (TIM_GetITStatus(TIM2, TIM_IT_Update) != RESET) {
-		 //begin1: 300ns - 450ns
-
-		if (loop_led_state[0] && (loop_led_PWM_ctr<global_param[LOOP_LED_BRIGHTNESS]))
+		if (loop_led_state[0] && (loop_led_PWM_ctr < global_param[LOOP_LED_BRIGHTNESS]))
 			LED_LOOP1_ON;
 		else
 			LED_LOOP1_OFF;
 
-		if (loop_led_state[1] && (loop_led_PWM_ctr<global_param[LOOP_LED_BRIGHTNESS]))
+		if (loop_led_state[1] && (loop_led_PWM_ctr < global_param[LOOP_LED_BRIGHTNESS]))
 			LED_LOOP2_ON;
 		else
 			LED_LOOP2_OFF;
 
-		if (loop_led_PWM_ctr++>32)
-			loop_led_PWM_ctr=0;
-
-		//end1: 300ns - 450ns
+		if (loop_led_PWM_ctr++ > 32)
+			loop_led_PWM_ctr = 0;
 
 		TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
-
 	}
-
 }

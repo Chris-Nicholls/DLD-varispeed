@@ -42,7 +42,7 @@ volatile uint32_t clkout_trigger_tmr;
 volatile uint32_t loopled_tmr[2];
 extern volatile uint32_t ping_time;
 extern uint8_t mode[NUM_CHAN][NUM_CHAN_MODES];
-extern uint8_t loop_led_state[NUM_CHAN];
+/* loop_led_state extern + set_loop_led inline now come from leds.h (already included above) */
 
 extern uint8_t global_mode[NUM_GLOBAL_MODES];
 
@@ -100,7 +100,7 @@ void reset_loopled_tmr(uint8_t channel)
 //	if (!mode[channel][CONTINUOUS_REVERSE])
 //	{
 		if (!global_mode[CALIBRATE] && !global_mode[SYSTEM_SETTINGS])
-			loop_led_state[channel]=1;
+			set_loop_led(channel, 1);
 
 		if (channel==0) {
 			CLKOUT1_ON;
@@ -174,11 +174,12 @@ void init_adc_param_update_timer(void)
 	nvic.NVIC_IRQChannelCmd = ENABLE;
 	NVIC_Init(&nvic);
 
-	//168MHz / prescale=3 ---> 42MHz / 30000 ---> 1.4kHz
+	//180MHz / prescale=3 (i.e. /4) ---> 45MHz / 32143 ---> 1.4kHz
+	//(was 168MHz / 4 = 42MHz / 30000 ---> 1.4kHz at 168MHz)
 	//20000 and 0x1 ==> works well
 
 	TIM_TimeBaseStructInit(&tim);
-	tim.TIM_Period = 30000;
+	tim.TIM_Period = 32143;
 	tim.TIM_Prescaler = 0x3;
 	tim.TIM_ClockDivision = 0;
 	tim.TIM_CounterMode = TIM_CounterMode_Up;
