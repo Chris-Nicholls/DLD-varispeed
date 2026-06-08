@@ -175,11 +175,18 @@ static int16_t effGains_t2[MAX_T2_TAPS] CCM_ATTR;
  *      values are what the macros produce at their default (D=0, Dec=0,
  *      Tone=0.83) positions; will be overwritten on the first macro call. */
 float reverb_send      = 0.7f;   /* updated each params iter from right MIX pot */
-float reverb_lpf_hz    = 4000.0f;
+float reverb_dry_gain  = 1.0f;   /* fades to 0 over top 10% of right MIX pot */
+float reverb_lpf_hz    = 4500.0f;
 float reverb_hpf_hz    = 100.0f;
 float reverb_t0_recirc = 0.0f;
 float reverb_t1_recirc = 0.25f;
 float reverb_t2_recirc = 0.0f;
+
+/* Global recirculation: feeds a few modulated taps of the long T2 tail back
+ * into T0's input, forming a T0→T1→T2→T0 loop on top of the per-stage recirc.
+ * Greatly extends/thickens the tail. Clamped to RECIRC_AMOUNT_CLAMP in the DSP
+ * for stability. 0 = off (default). */
+float reverb_global_recirc = 0.0f;
 
 float reverb_t0_count_target     = 1.0f;
 float reverb_t1_count_target     = 0.0f;
@@ -191,20 +198,73 @@ float reverb_t2_duration_s_target = 0.213f;
 
 float reverb_t1_decay_shape = 0.0f;
 float reverb_t2_decay_shape = 0.0f;
-float reverb_recirc_mod_depth_pct = 0.07f;
+float reverb_recirc_mod_depth_pct = 0.06f;
+
+/* Feedback high-shelf damping amount applied in every recirc loop, between the
+ * one-pole LP damping and the 100 Hz HPF. 0 = pure LP (darkest, HF dies fast);
+ * 1 = no HF damping (flat); in between, HF decays faster than LF by this ratio. */
+float reverb_recirc_damp_hf_gain = 0.1f;
 
 /* ==== Hardcoded constants (recirc modulation + damping, gain-comp clamp) ====
  * Rates / damping match the JS app's velvet_buffers_sliders snapshot
  * (paramRecircModRate=0.55, paramRecircDamp=10800). Not macro-driven. */
-#define RECIRC_MOD_RATE_HZ    2.3f
+#define RECIRC_MOD_RATE_HZ    0.5f
 #define RECIRC_DAMP_FREQ_HZ   2600.0f
-#define RECIRC_AMOUNT_CLAMP   0.85f
-#define TAP_COMP_CLAMP        8.0f       /* max gain-comp boost (avoid int16 overflow) */
+#define RECIRC_HPF_FREQ_HZ    100.0f   /* one-pole HPF in each feedback loop — blocks
+                                        * sub-100 Hz / DC accumulation in the recirc */
+#define RECIRC_AMOUNT_CLAMP   1.0f
+#define TAP_COMP_CLAMP        2.0f       /* max gain-comp boost (avoid int16 overflow) */
+
+/* Absolute floor (in samples) on the recirc position-modulation depth.
+ * The per-stage mod depth is normally a fraction of each stage's window, so at
+ * low decay (short windows) it collapses toward zero — and the recirc tap
+ * ladders bottom out near TAP_MIN_OFFSET, forming ~130-280 sample feedback
+ * loops. An un-modulated loop that short rings as a fixed low-mid comb
+ * (~110-190 Hz). This floor keeps a minimum continuous modulation so those
+ * short loops stay smeared instead of resonating. Only affects output when a
+ * stage's recirc is active (the recirc fns early-return at amt<=0). Set to 0
+ * to restore the pure window-proportional behaviour. */
+#define RECIRC_MOD_DEPTH_MIN_SAMPLES  6.0f
+
+/* Minimum read offset (in samples) for the *recirc* tap ladders — a recirc-only
+ * floor, larger than the main taps' TAP_MIN_OFFSET. Stops the recirc ladders
+ * descending into ~130-280 sample rungs whose feedback loops ring as a low-mid
+ * comb (~110-190 Hz). At 480 the shortest recirc loop's comb fundamental is
+ * 24000/480 = 50 Hz (sub-bass, below the output HPF). When the morphed window
+ * shrinks below the deepest remaining rung, compute_tap_states fades the recirc
+ * tap out (gain 0) rather than forming a short loop. Main taps are unaffected. */
+#define RECIRC_MIN_OFFSET  480
+
+/* Mid-side stereo width applied to the final T2 output in do_finalize.
+ * 1.0 = neutral, <1 narrows toward mono, >1 widens by boosting the
+ * decorrelated (L-R) component. Only T2 is stereo (T0/T1 are mono), so this
+ * directly scales that decorrelation. Hard-coded for now. */
+#define REVERB_STEREO_WIDTH   1.79f
+
+/* Internal headroom. The whole int16 cascade runs at REVERB_HEADROOM × level
+ * (cooler), and the output is scaled back up by REVERB_OUT_MAKEUP = 1/headroom.
+ * This mirrors the JS float path's headroom: inter-stage values that would push
+ * past int16 full-scale (conv-sum peaks, recirc feedback, etc.) now sit below
+ * it, so the soft knee (below) rarely engages — matching the JS until a true
+ * over. Cost: the internal computation runs ~6 dB closer to the int16 LSB at
+ * 0.5, so the quietest tail loses ~1 bit of SNR. Raise toward 1.0 if the decay
+ * sounds grainy; lower toward 0.5 if clipping persists. The pre-T2 saturator is
+ * gain-compensated (see apply_pre_t2_sat) so its drive/character is unchanged. */
+#define REVERB_HEADROOM    0.5f
+#define REVERB_OUT_MAKEUP  (1.0f / REVERB_HEADROOM)
+
+/* Soft-knee threshold (full-scale units) for the inter-stage / output
+ * saturators. |x| <= threshold passes through linearly (transparent, like the
+ * JS); above it a C1 rational knee rounds off toward ±1.0 instead of the old
+ * hard int16 clamp. With the headroom above, signals normally stay under the
+ * threshold; the knee only shapes genuine overs. */
+#define SOFT_KNEE_T  0.80f
 
 #define T0_RECIRC_TAPS    2
 #define T1_RECIRC_TAPS    2
 #define T2_RECIRC_TAPS    3
-#define RECIRC_MOD_TOTAL  (T0_RECIRC_TAPS + T1_RECIRC_TAPS + T2_RECIRC_TAPS)
+#define GLOBAL_RECIRC_TAPS 3   /* T2 tail -> T0 input global feedback taps */
+#define RECIRC_MOD_TOTAL  (T0_RECIRC_TAPS + T1_RECIRC_TAPS + T2_RECIRC_TAPS + GLOBAL_RECIRC_TAPS)
 
 /* ==== Macro system ==== Mirrors the JS prototype's velvet_param_bounds +
  * velvet_macros snapshot. Three macros (Density, Decay, Tone), each with a
@@ -214,6 +274,7 @@ typedef enum {
     MP_T0_COUNT, MP_T0_WINDOW, MP_T0_RECIRC,
     MP_T1_COUNT, MP_T1_WINDOW, MP_T1_DECAY, MP_T1_RECIRC,
     MP_T2_COUNT, MP_T2_DURATION, MP_T2_DECAY, MP_T2_RECIRC,
+    MP_GLOBAL_RECIRC,
     MP_LPF, MP_HPF,
     MP_COUNT
 } macro_param_id_t;
@@ -237,40 +298,45 @@ typedef struct {
     const macro_mapping_t *mappings;
 } macro_t;
 
+/* Bounds + use_exp mirror the JS velvet_param_bounds + recomputeAllMacroParams:
+ * exp lerp where the last macro mapping the param qualifies (decay/tone → all;
+ * density → tap-count only) AND min>0, max>0, min!=max — which resolves to exp
+ * for T0 count, T0/T1 window, T2 duration, LPF, HPF; linear for the rest.
+ * Stage remap JS→firmware: paramT1→T0, paramTm→T1, paramT2Taps→T2. */
 static macro_param_t reverb_macro_params[MP_COUNT] = {
-    [MP_T0_COUNT]    = { &reverb_t0_count_target,     1.0f,   32.0f,    1 },
-    [MP_T0_WINDOW]   = { &reverb_t0_window_ms_target, 40.0f,  200.0f,   1 },
-    [MP_T0_RECIRC]   = { &reverb_t0_recirc,           0.0f,   0.0f,     0 },
-    [MP_T1_COUNT]    = { &reverb_t1_count_target,     0.0f,   32.0f,    0 },
-    [MP_T1_WINDOW]   = { &reverb_t1_window_ms_target, 100.0f, 660.0f,   1 },
-    [MP_T1_DECAY]    = { &reverb_t1_decay_shape,      0.0f,   0.98f,    1 },
-    [MP_T1_RECIRC]   = { &reverb_t1_recirc,           0.25f,  1.5f,     1 },
-    [MP_T2_COUNT]    = { &reverb_t2_count_target,     10.0f,  32.0f,    1 },
-    [MP_T2_DURATION] = { &reverb_t2_duration_s_target, 0.213f, 3.0f,    1 },
-    [MP_T2_DECAY]    = { &reverb_t2_decay_shape,      0.0f,   1.0f,     1 },
-    [MP_T2_RECIRC]   = { &reverb_t2_recirc,           0.0f,   1.8f,     1 },
-    /* TEMPORARILY pinned — isolating periodic-click root cause (issue 3).
-     * With min==max the lerp always lands on the same value and biquad
-     * coefficient recompute fires exactly once (at init), never again. */
-    [MP_LPF]         = { &reverb_lpf_hz,              4000.0f, 4000.0f, 0 },
-    [MP_HPF]         = { &reverb_hpf_hz,              100.0f,  100.0f,  0 },
+    [MP_T0_COUNT]     = { &reverb_t0_count_target,      1.0f,   40.0f,    1 }, /* paramT1 */
+    [MP_T0_WINDOW]    = { &reverb_t0_window_ms_target,  80.0f,  100.0f,   1 }, /* paramT1Window */
+    [MP_T0_RECIRC]    = { &reverb_t0_recirc,            0.0f,   0.0f,     0 }, /* paramT1Recirc */
+    [MP_T1_COUNT]     = { &reverb_t1_count_target,      0.0f,   40.0f,    0 }, /* paramTm */
+    [MP_T1_WINDOW]    = { &reverb_t1_window_ms_target,  150.0f, 660.0f,   1 }, /* paramTmWindow */
+    [MP_T1_DECAY]     = { &reverb_t1_decay_shape,       0.0f,   2.0f,     0 }, /* paramTmDecay */
+    [MP_T1_RECIRC]    = { &reverb_t1_recirc,            0.0f,   0.0f,     0 }, /* paramTmRecirc */
+    [MP_T2_COUNT]     = { &reverb_t2_count_target,      0.0f,   32.0f,    0 }, /* paramT2Taps */
+    [MP_T2_DURATION]  = { &reverb_t2_duration_s_target, 0.1f,   3.0f,     1 }, /* paramT2Duration */
+    [MP_T2_DECAY]     = { &reverb_t2_decay_shape,       0.0f,   1.0f,     0 }, /* toggleT2Linear */
+    [MP_T2_RECIRC]    = { &reverb_t2_recirc,            0.0f,   1.0f,     0 }, /* paramT2Recirc */
+    [MP_GLOBAL_RECIRC]= { &reverb_global_recirc,        0.0f,   0.2f,     0 }, /* paramGlobalRecirc */
+    [MP_LPF]          = { &reverb_lpf_hz,               400.0f, 10000.0f, 1 }, /* paramLpf */
+    [MP_HPF]          = { &reverb_hpf_hz,               20.0f,  300.0f,   1 }, /* paramHpf */
 };
 
 static const macro_mapping_t density_mappings[] = {
-    { MP_T0_COUNT,  0.0f, 1.0f },
-    { MP_T2_COUNT,  0.0f, 1.0f },
-    { MP_T1_RECIRC, 0.0f, 1.0f },
-    { MP_T1_COUNT,  0.0f, 1.0f },
-    { MP_T2_RECIRC, 0.0f, 1.0f },
+    { MP_T0_COUNT,      0.0f, 1.0f },   /* paramT1 */
+    { MP_T2_COUNT,      0.0f, 1.0f },   /* paramT2Taps */
+    { MP_T1_COUNT,      0.0f, 1.0f },   /* paramTm */
+    { MP_GLOBAL_RECIRC, 0.0f, 1.0f },   /* paramGlobalRecirc */
 };
 static const macro_mapping_t decay_mappings[] = {
-    { MP_T2_DURATION, 0.0f, 1.0f },
-    { MP_T0_WINDOW,   0.0f, 1.0f },
-    { MP_T1_WINDOW,   0.0f, 1.0f },
-    { MP_T1_DECAY,    0.0f, 1.0f },
-    { MP_T2_DECAY,    0.0f, 1.0f },
-    { MP_T2_RECIRC,   0.0f, 1.0f },
-    { MP_T1_RECIRC,   0.0f, 1.0f },
+    { MP_T2_DURATION,   0.0f, 1.0f },   /* paramT2Duration */
+    { MP_T0_WINDOW,     0.0f, 1.0f },   /* paramT1Window */
+    { MP_T1_WINDOW,     0.0f, 1.0f },   /* paramTmWindow */
+    { MP_T1_DECAY,      0.0f, 1.0f },   /* paramTmDecay */
+    { MP_T2_DECAY,      0.0f, 1.0f },   /* toggleT2Linear */
+    { MP_T2_RECIRC,     0.0f, 0.6f },   /* paramT2Recirc (hi 0.6) */
+    { MP_T1_RECIRC,     0.0f, 1.0f },   /* paramTmRecirc */
+    { MP_GLOBAL_RECIRC, 0.0f, 1.0f },   /* paramGlobalRecirc */
+    { MP_T2_COUNT,      0.0f, 1.0f },   /* paramT2Taps */
+    { MP_T0_COUNT,      0.0f, 1.0f },   /* paramT1 */
 };
 static const macro_mapping_t tone_mappings[] = {
     { MP_LPF, 0.0f, 1.0f },
@@ -278,16 +344,14 @@ static const macro_mapping_t tone_mappings[] = {
 };
 
 #define M_COUNT(arr) (int)(sizeof(arr) / sizeof((arr)[0]))
-/* Density gets a cubic pre-curve on top of the per-param exp lerp: the
- * three cascaded sparse stages compound multiplicatively, so a single
- * stage's tap count ~ u becomes a perceived reflection density ~ u^3.
- * Cubing the macro input first puts the audible density on a roughly
- * linear-in-u curve so the bottom 80 % of knob travel produces a usable
- * gradient of densities instead of jumping straight to "dense". */
+/* No pre-curve (curve_power = 1.0) — the JS recomputeAllMacroParams uses the
+ * slider value directly. Density/Decay values are overwritten each iteration
+ * from the LEVEL/REGEN pots (see params.c); Tone has no pot, so its default
+ * (0.62) is the value the user dialled in. */
 static macro_t reverb_macros[3] = {
-    { 0.0f,  3.0f, M_COUNT(density_mappings), density_mappings },
+    { 0.0f,  1.0f, M_COUNT(density_mappings), density_mappings },
     { 0.0f,  1.0f, M_COUNT(decay_mappings),   decay_mappings   },
-    { 0.83f, 1.0f, M_COUNT(tone_mappings),    tone_mappings    },
+    { 0.62f, 1.0f, M_COUNT(tone_mappings),    tone_mappings    },
 };
 
 /* Macro recompute is ~14 powf calls (~17 µs). Called from params.c at
@@ -388,6 +452,15 @@ static float recirc_damp_coeff;
 static float recirc_damp_t0 CCM_ATTR;
 static float recirc_damp_t1 CCM_ATTR;
 static float recirc_damp_t2 CCM_ATTR;
+static float recirc_damp_global CCM_ATTR;   /* damping state for the T2->T0 global loop */
+
+/* One-pole HPF in each feedback loop: hp_state is the low-passed feedback; the
+ * high-passed output = fb - hp_state. Removes sub-RECIRC_HPF_FREQ_HZ buildup. */
+static float recirc_hp_coeff;
+static float recirc_hp_t0 CCM_ATTR;
+static float recirc_hp_t1 CCM_ATTR;
+static float recirc_hp_t2 CCM_ATTR;
+static float recirc_hp_global CCM_ATTR;
 
 /* Recirc-tap position ladders + per-block effective state. Each recirc tap
  * walks a discrete geometric ladder identical in shape to the main taps' —
@@ -463,8 +536,8 @@ static uint8_t  reader_buf_R = 0;
 static uint8_t  out_idx_L = 0;
 static uint8_t  out_idx_R = 0;
 
-static int16_t prev_out_L = 0;
-static int16_t prev_out_R = 0;
+static float prev_out_L = 0.0f;   /* width-processed reverb-rate output (for upsample interp) */
+static float prev_out_R = 0.0f;
 
 static int16_t dma_scratch[2][REVERB_BLOCK] __attribute__((aligned(4)));
 static uint8_t dma_buf_idx = 0;
@@ -480,6 +553,13 @@ static uint32_t xorshift32(void)
     prng_state = x;
     return x;
 }
+
+#ifdef VELVET_REVERB_HOST
+/* Test hook (host only): reseed the tap-generation PRNG so two regenerations
+ * produce an identical random layout. Lets the spectral harness vary one
+ * parameter at a time with the tap positions held fixed. */
+void host_reset_prng(void) { prng_state = 0xDEADBEEF; }
+#endif
 
 /* ==== Triangle wave LFO ==== Cheap stand-in for sin() on the recirc-mod
  * path. The mod runs sub-Hz so spectral content above the fundamental sits
@@ -517,17 +597,48 @@ static inline float window_gain_from_offset(uint32_t offset, float windowSamples
 #define ENV_FRAC_BINS  32
 static float exp_env_lut[ENV_FRAC_BINS] CCM_ATTR;
 
+/* Largest plateau exponent (at shape = 2): 1 - frac^P. Higher = flatter hold
+ * and a faster fade right at the end. */
+#define DECAY_PLATEAU_P  10.0f
+
+/* Plateau LUT for the shape ∈ (1,2] region. 2D: shape rows × frac columns,
+ * plateau_lut[s][f] = 1 - (f/(N-1))^P(s), P(s) sweeping 1 (linear) ->
+ * DECAY_PLATEAU_P across the rows. Filled with powf once at init so the per-tap
+ * runtime cost is a bilinear lerp (no powf in recompute_eff_gains, which runs in
+ * the main-loop block path — a per-tap powf there overran the block budget). */
+#define PLATEAU_SHAPE_BINS  16
+static float plateau_lut[PLATEAU_SHAPE_BINS * ENV_FRAC_BINS] CCM_ATTR;
+
+/* shape: 0 = exponential, 1 = linear, 2 = "logarithmic" plateau (stays loud
+ * across the window, quick fade only at the very end). 0..1 blends exp->linear
+ * via exp_env_lut; 1..2 bilinearly interpolates plateau_lut. Continuous at
+ * shape = 1 (linEnv == plateau row 0, P = 1). */
 static inline float decay_envelope_from_frac(float frac, float shape)
 {
     if (frac < 0.0f) frac = 0.0f;
     if (frac > 1.0f) frac = 1.0f;
-    float bin_f = frac * (float)(ENV_FRAC_BINS - 1);
-    int i = (int)bin_f;
-    if (i > ENV_FRAC_BINS - 2) i = ENV_FRAC_BINS - 2;
-    float t = bin_f - (float)i;
-    float expEnv = exp_env_lut[i] + t * (exp_env_lut[i + 1] - exp_env_lut[i]);
-    float linEnv = 1.0f - frac;
-    return expEnv + shape * (linEnv - expEnv);
+    if (shape <= 1.0f) {
+        float bin_f = frac * (float)(ENV_FRAC_BINS - 1);
+        int i = (int)bin_f;
+        if (i > ENV_FRAC_BINS - 2) i = ENV_FRAC_BINS - 2;
+        float t = bin_f - (float)i;
+        float expEnv = exp_env_lut[i] + t * (exp_env_lut[i + 1] - exp_env_lut[i]);
+        float linEnv = 1.0f - frac;
+        return expEnv + shape * (linEnv - expEnv);
+    }
+    /* Bilinear interp into plateau_lut (shape-1 over the rows, frac over cols). */
+    float sN = shape - 1.0f; if (sN > 1.0f) sN = 1.0f;
+    float s_f = sN * (float)(PLATEAU_SHAPE_BINS - 1);
+    int si = (int)s_f; if (si > PLATEAU_SHAPE_BINS - 2) si = PLATEAU_SHAPE_BINS - 2;
+    float st = s_f - (float)si;
+    float f_f = frac * (float)(ENV_FRAC_BINS - 1);
+    int fi = (int)f_f; if (fi > ENV_FRAC_BINS - 2) fi = ENV_FRAC_BINS - 2;
+    float ft = f_f - (float)fi;
+    const float *r0 = &plateau_lut[si * ENV_FRAC_BINS];
+    const float *r1 = &plateau_lut[(si + 1) * ENV_FRAC_BINS];
+    float a = r0[fi] + ft * (r0[fi + 1] - r0[fi]);
+    float b = r1[fi] + ft * (r1[fi + 1] - r1[fi]);
+    return a + st * (b - a);
 }
 
 /* ==== Biquad cookbook coefficients ==== */
@@ -635,7 +746,7 @@ static inline void dma2_fetch_tap(uint32_t tapOffset, int16_t *dst)
  * taps land on identical positions). For T2 the same jitter value is passed
  * in by the caller for both L and R chains so their divergence stays bounded
  * across rungs — see below. */
-static int build_tap_ladder(uint16_t *ladder, uint32_t mainOffset)
+static int build_tap_ladder(uint16_t *ladder, uint32_t mainOffset, uint32_t minOffset)
 {
     uint32_t cur = mainOffset;
     ladder[0] = (uint16_t)cur;
@@ -650,10 +761,10 @@ static int build_tap_ladder(uint16_t *ladder, uint32_t mainOffset)
         /* Round to even so the SIMD uint32 reads in do_t*_phase stay 4-byte
          * aligned. Same constraint generate_mono_stage applies to lad[0]. */
         signedNxt &= ~1;
-        if (signedNxt < TAP_MIN_OFFSET) break;
+        if (signedNxt < (int32_t)minOffset) break;
         if (signedNxt > (int32_t)cur - TAP_MIN_GRID)
             signedNxt = ((int32_t)cur - TAP_MIN_GRID) & ~1;
-        if (signedNxt < TAP_MIN_OFFSET) break;
+        if (signedNxt < (int32_t)minOffset) break;
         ladder[n] = (uint16_t)signedNxt;
         cur = (uint32_t)signedNxt;
         n++;
@@ -666,6 +777,9 @@ static int build_tap_ladder(uint16_t *ladder, uint32_t mainOffset)
  * the per-channel L_0 jitter and tapers geometrically with the rung). With
  * an independent draw per channel, deep-rung divergence accumulates and is
  * heard as a ping-pong delay. */
+/* Superseded by build_gapfill_ladders for the T2 main taps; kept for reference. */
+static int build_tap_ladder_lr(uint16_t *ladderL, uint16_t *ladderR,
+                               uint32_t mainOffsetL, uint32_t mainOffsetR) __attribute__((unused));
 static int build_tap_ladder_lr(uint16_t *ladderL, uint16_t *ladderR,
                                uint32_t mainOffsetL, uint32_t mainOffsetR)
 {
@@ -759,6 +873,17 @@ static void compute_tap_ranks(const uint32_t *offsets, float *ranks, int count)
     }
 }
 
+#ifdef VELVET_REVERB_HOST
+/* Test hook (host only): when 0, tap 0 is jittered like the others instead of
+ * being pinned to TAP_MIN_OFFSET. Lets the spectral harness A/B whether the
+ * pinned, triple-correlated early tap is responsible for a fixed spectral peak.
+ * Firmware build always pins tap 0 (this symbol does not exist there). */
+int host_pin_tap0 = 1;
+#define TAP0_PINNED(j) ((j) == 0 && host_pin_tap0)
+#else
+#define TAP0_PINNED(j) ((j) == 0)
+#endif
+
 /* Generate one mono sparse-velvet stage. `apply_taper` controls whether the
  * cosine tail-taper is baked into the gains (T0 yes, T1/T2 no — they get the
  * decay envelope applied dynamically per-block instead). */
@@ -784,7 +909,7 @@ static void generate_mono_stage(uint32_t *outOffsets, int16_t *outGains, float *
         /* Pin tap 0 to exactly TAP_MIN_OFFSET so every stage has a tap at
          * the very start of its window — guarantees an early reflection
          * regardless of window size. */
-        int jit = (j == 0) ? 0 : (int)(xorshift32() % (uint32_t)jitterRange);
+        int jit = TAP0_PINNED(j) ? 0 : (int)(xorshift32() % (uint32_t)jitterRange);
         int pos = TAP_MIN_OFFSET + j * gridSize + jit;
         if (pos >= windowSamples) pos = TAP_MIN_OFFSET + j * gridSize;
 
@@ -800,6 +925,92 @@ static void generate_mono_stage(uint32_t *outOffsets, int16_t *outGains, float *
     }
     *outCount = n;
     compute_tap_ranks(outOffsets, outRanks, n);
+}
+
+/* ---- Gap-fill ladder builder (MAIN taps) ----
+ * Mirrors the JS app's buildGapFill. As the window shrinks, the tap at the
+ * largest offset "falls off the end" and is reinserted into the largest interior
+ * gap among the remaining taps — keeping them roughly equally spaced (velvet) and
+ * the density up, instead of the geometric ×0.25 descent that scrambled the
+ * spacing into [W/4, W). Produces a strictly-decreasing position sequence per tap
+ * (rungs) — the exact structure compute_tap_states already consumes (silent
+ * bell-crossfade at each boundary, one tap moving at a time).
+ *
+ * Mono (offR == NULL) for T0/T1; stereo for T2, where the L channel drives the
+ * gap choice and R relocates into the same gap (between the same neighbour taps)
+ * with a shared jitter draw, so L/R divergence stays bounded as before. Recirc
+ * ladders keep the geometric build_tap_ladder (a feedback-delay chain, not a
+ * window-filling layout). */
+static inline int gapfill_clamp(int v, int lo, int hi, int minOffset)
+{
+    int a = lo + TAP_MIN_GRID, b = hi - TAP_MIN_GRID;
+    if (b < a) { a = b = (lo + hi) / 2; }
+    if (v < a) v = a;
+    if (v > b) v = b;
+    if (v < minOffset) v = minOffset;
+    return v & ~1;   /* even — SIMD pair-read alignment in do_t*_phase */
+}
+
+static void build_gapfill_ladders(const uint32_t *offL, const uint32_t *offR, int count,
+                                  uint16_t *ladL, uint16_t *ladR, uint8_t *ladderCount,
+                                  int minOffset)
+{
+    int curL[MAX_STAGE_TAPS], curR[MAX_STAGE_TAPS], ord[MAX_STAGE_TAPS];
+    int stereo = (offR != NULL);
+    for (int k = 0; k < count; k++) {
+        curL[k] = (int)offL[k];
+        ladL[k * MAX_LADDER_LEVELS] = (uint16_t)offL[k];
+        if (stereo) { curR[k] = (int)offR[k]; ladR[k * MAX_LADDER_LEVELS] = (uint16_t)offR[k]; }
+        ladderCount[k] = 1;
+    }
+    int steps = count * MAX_LADDER_LEVELS;
+    while (steps-- > 0) {
+        /* tap at the largest current (L) position that still has ladder room */
+        int endTap = -1, endPos = -1;
+        for (int k = 0; k < count; k++) {
+            if (ladderCount[k] >= MAX_LADDER_LEVELS) continue;
+            if (curL[k] > endPos) { endPos = curL[k]; endTap = k; }
+        }
+        if (endTap < 0) break;
+        /* sorted indices of the other taps below endPos */
+        int m = 0;
+        for (int k = 0; k < count; k++)
+            if (k != endTap && curL[k] < endPos) ord[m++] = k;
+        for (int a = 1; a < m; a++) {
+            int vi = ord[a], vp = curL[vi], b = a - 1;
+            while (b >= 0 && curL[ord[b]] > vp) { ord[b + 1] = ord[b]; b--; }
+            ord[b + 1] = vi;
+        }
+        /* largest bottom/interior gap (top edge gap above the highest tap excluded
+         * so the fallen tap densifies the interior rather than re-creating the end) */
+        int bestSize = -1, bestLoIdx = -1, bestHiIdx = -1;
+        int prevPos = minOffset, prevIdx = -1;
+        for (int gi = 0; gi < m; gi++) {
+            int hiIdx = ord[gi], hiPos = curL[hiIdx];
+            int gap = hiPos - prevPos;
+            if (gap > bestSize) { bestSize = gap; bestLoIdx = prevIdx; bestHiIdx = hiIdx; }
+            prevPos = hiPos; prevIdx = hiIdx;
+        }
+        if (bestSize < 2 * TAP_MIN_GRID || bestHiIdx < 0) break;
+        int loL = (bestLoIdx < 0) ? minOffset : curL[bestLoIdx];
+        int hiL = curL[bestHiIdx];
+        int span = hiL - loL; if (span > TAP_MIN_GRID * 8) span = TAP_MIN_GRID * 8;
+        int jitMag = span >> 2;
+        int jit = (jitMag > 0) ? (int)(xorshift32() % (uint32_t)(jitMag * 2 + 1)) - jitMag : 0;
+        int newL = gapfill_clamp(((loL + hiL) / 2) + jit, loL, hiL, minOffset);
+        if (newL >= curL[endTap]) break;   /* must descend */
+        ladL[endTap * MAX_LADDER_LEVELS + ladderCount[endTap]] = (uint16_t)newL;
+        if (stereo) {
+            int loR = (bestLoIdx < 0) ? minOffset : curR[bestLoIdx];
+            int hiR = curR[bestHiIdx];
+            if (hiR < loR) { int t = hiR; hiR = loR; loR = t; }
+            int newR = gapfill_clamp(((loR + hiR) / 2) + jit, loR, hiR, minOffset);
+            ladR[endTap * MAX_LADDER_LEVELS + ladderCount[endTap]] = (uint16_t)newR;
+            curR[endTap] = newR;
+        }
+        ladderCount[endTap]++;
+        curL[endTap] = newL;
+    }
 }
 
 void velvet_reverb_regenerate_taps(void)
@@ -827,8 +1038,8 @@ void velvet_reverb_regenerate_taps(void)
 
     for (int j = 0; j < t2Num; j++) {
         /* Tap 0 pinned to TAP_MIN_OFFSET on both channels (see generate_mono_stage). */
-        int jitL = (j == 0) ? 0 : (int)(xorshift32() % (uint32_t)jitterRange2);
-        int jitR = (j == 0) ? 0 : (int)(xorshift32() % (uint32_t)jitterRange2);
+        int jitL = TAP0_PINNED(j) ? 0 : (int)(xorshift32() % (uint32_t)jitterRange2);
+        int jitR = TAP0_PINNED(j) ? 0 : (int)(xorshift32() % (uint32_t)jitterRange2);
         int posL = TAP_MIN_OFFSET + j * gridSize2 + jitL;
         int posR = TAP_MIN_OFFSET + j * gridSize2 + jitR;
         if (posL >= T2_DURATION_MAX_SAMPLES) posL = TAP_MIN_OFFSET + j * gridSize2;
@@ -864,25 +1075,16 @@ void velvet_reverb_regenerate_taps(void)
     }
 
     /* ----------------------------------------------------------------
-     * Build per-tap position ladders. Each tap's L_0 rung is its main
-     * offset (already generated above); deeper rungs descend geometrically
-     * with per-rung jitter. Used at runtime by compute_tap_states to
-     * migrate each tap one rung down as the window shrinks past its
-     * current rung. */
-    for (int j = 0; j < t0TapCount; j++) {
-        t0TapLadderCount[j] = (uint8_t)build_tap_ladder(
-            &t0TapLadder[j * MAX_LADDER_LEVELS], t0TapOffsets[j]);
-    }
-    for (int j = 0; j < t1TapCount; j++) {
-        t1TapLadderCount[j] = (uint8_t)build_tap_ladder(
-            &t1TapLadder[j * MAX_LADDER_LEVELS], t1TapOffsets[j]);
-    }
-    for (int j = 0; j < t2TapCount; j++) {
-        t2TapLadderCount[j] = (uint8_t)build_tap_ladder_lr(
-            &t2TapLadderL[j * MAX_LADDER_LEVELS],
-            &t2TapLadderR[j * MAX_LADDER_LEVELS],
-            t2TapOffsetsL[j], t2TapOffsetsR[j]);
-    }
+     * Build per-tap position ladders (MAIN taps) via gap-fill: as the window
+     * shrinks the end tap is reinserted into the largest interior gap, keeping
+     * the spacing velvet and the density up. Used at runtime by
+     * compute_tap_states to migrate each tap as the window shrinks. */
+    build_gapfill_ladders(t0TapOffsets, NULL, t0TapCount,
+                          t0TapLadder, NULL, t0TapLadderCount, TAP_MIN_OFFSET);
+    build_gapfill_ladders(t1TapOffsets, NULL, t1TapCount,
+                          t1TapLadder, NULL, t1TapLadderCount, TAP_MIN_OFFSET);
+    build_gapfill_ladders(t2TapOffsetsL, t2TapOffsetsR, t2TapCount,
+                          t2TapLadderL, t2TapLadderR, t2TapLadderCount, TAP_MIN_OFFSET);
 
     /* Recirc tap ladders. Each recirc tap's L_0 sits at a fixed fraction of
      * its stage's max window; deeper rungs descend geometrically through
@@ -896,17 +1098,17 @@ void velvet_reverb_regenerate_taps(void)
         for (int r = 0; r < T0_RECIRC_TAPS; r++) {
             uint32_t off = (uint32_t)((float)T0_WINDOW_MAX_SAMPLES * t0_recirc_l0_frac[r]);
             t0RecircLadderCount[r] = (uint8_t)build_tap_ladder(
-                &t0RecircLadder[r * MAX_LADDER_LEVELS], off);
+                &t0RecircLadder[r * MAX_LADDER_LEVELS], off, RECIRC_MIN_OFFSET);
         }
         for (int r = 0; r < T1_RECIRC_TAPS; r++) {
             uint32_t off = (uint32_t)((float)T1_WINDOW_MAX_SAMPLES * t1_recirc_l0_frac[r]);
             t1RecircLadderCount[r] = (uint8_t)build_tap_ladder(
-                &t1RecircLadder[r * MAX_LADDER_LEVELS], off);
+                &t1RecircLadder[r * MAX_LADDER_LEVELS], off, RECIRC_MIN_OFFSET);
         }
         for (int r = 0; r < T2_RECIRC_TAPS; r++) {
             uint32_t off = (uint32_t)((float)T2_DURATION_MAX_SAMPLES * t2_recirc_l0_frac[r]);
             t2RecircLadderCount[r] = (uint8_t)build_tap_ladder(
-                &t2RecircLadder[r * MAX_LADDER_LEVELS], off);
+                &t2RecircLadder[r * MAX_LADDER_LEVELS], off, RECIRC_MIN_OFFSET);
         }
     }
 }
@@ -970,16 +1172,18 @@ void velvet_reverb_init(void)
     last_lpf_hz = reverb_lpf_hz;
 
     /* Recirc state */
-    recirc_damp_t0 = recirc_damp_t1 = recirc_damp_t2 = 0.0f;
+    recirc_damp_t0 = recirc_damp_t1 = recirc_damp_t2 = recirc_damp_global = 0.0f;
+    recirc_hp_t0 = recirc_hp_t1 = recirc_hp_t2 = recirc_hp_global = 0.0f;
     /* Per-stage mod depths set fresh each block from window × percent — see
      * update_morph_state. Seed here so the first block has sane values. */
     {
         float frac = reverb_recirc_mod_depth_pct * 0.01f;
-        t0_rc_mod_depth_samples = frac * t0_window_morph;
-        t1_rc_mod_depth_samples = frac * t1_window_morph;
-        t2_rc_mod_depth_samples = frac * t2_window_morph;
+        t0_rc_mod_depth_samples = fmaxf(frac * t0_window_morph, RECIRC_MOD_DEPTH_MIN_SAMPLES);
+        t1_rc_mod_depth_samples = fmaxf(frac * t1_window_morph, RECIRC_MOD_DEPTH_MIN_SAMPLES);
+        t2_rc_mod_depth_samples = fmaxf(frac * t2_window_morph, RECIRC_MOD_DEPTH_MIN_SAMPLES);
     }
     recirc_damp_coeff    = 1.0f - expf(-TWO_PI_F * RECIRC_DAMP_FREQ_HZ / (float)REVERB_FS_HZ);
+    recirc_hp_coeff      = 1.0f - expf(-TWO_PI_F * RECIRC_HPF_FREQ_HZ / (float)REVERB_FS_HZ);
     {
         const float PHI = 1.6180339887498949f;
         float base_rate = TWO_PI_F * RECIRC_MOD_RATE_HZ / (float)REVERB_FS_HZ;
@@ -1012,6 +1216,16 @@ void velvet_reverb_init(void)
     for (int i = 0; i < ENV_FRAC_BINS; i++) {
         float frac = (float)i / (float)(ENV_FRAC_BINS - 1);
         exp_env_lut[i] = expf(-9.21034f * frac);
+    }
+
+    /* Pre-compute the plateau LUT (shape 1..2 region) so the runtime envelope is
+     * a bilinear lerp instead of a per-tap powf. powf only runs here, at init. */
+    for (int s = 0; s < PLATEAU_SHAPE_BINS; s++) {
+        float P = 1.0f + ((float)s / (float)(PLATEAU_SHAPE_BINS - 1)) * (DECAY_PLATEAU_P - 1.0f);
+        for (int f = 0; f < ENV_FRAC_BINS; f++) {
+            float frac = (float)f / (float)(ENV_FRAC_BINS - 1);
+            plateau_lut[s * ENV_FRAC_BINS + f] = 1.0f - powf(frac, P);
+        }
     }
 
     velvet_reverb_regenerate_taps();
@@ -1066,18 +1280,45 @@ void velvet_reverb_init(void)
 }
 
 /* ==== Saturate helpers ==== */
+
+/* Soft knee in full-scale units (1.0 == full scale). Transparent (unity, like
+ * the JS float path) for |x| <= SOFT_KNEE_T; above it a rational knee that is
+ * C1-continuous at the threshold (value and slope match the linear region) and
+ * asymptotes to ±1.0. Replaces the old hard clip so overs round off musically
+ * instead of clipping harshly. */
+static inline float soft_clip_unit(float x)
+{
+    float a = (x < 0.0f) ? -x : x;
+    if (a <= SOFT_KNEE_T) return x;
+    float k = 1.0f - SOFT_KNEE_T;
+    float e = a - SOFT_KNEE_T;
+    float y = SOFT_KNEE_T + k * e / (k + e);   /* -> 1.0, slope 1 at threshold */
+    return (x < 0.0f) ? -y : y;
+}
+
+/* Q30 accumulator (Q15 sample × Q15 gain, summed) -> int16, soft-clipped at
+ * full scale. 2^30 = full scale in the Q30 domain. Used at the stage bridges
+ * and the output read. */
 static inline int16_t soft_saturate_q15(int32_t x)
 {
-    int32_t n = x >> 15;
-    if (n > 32767) return 32767;
-    if (n < -32767) return -32767;
-    return (int16_t)n;
+    float v = (float)x * (1.0f / 1073741824.0f);   /* 2^30 == full scale */
+    return (int16_t)(soft_clip_unit(v) * 32767.0f);
 }
+
+/* Hard int16 clamp — kept for coefficient clamping (effGains) and anywhere a
+ * true hard limit is wanted. */
 static inline int16_t clamp_f_to_int16(float v)
 {
     if (v > 32767.0f) return 32767;
     if (v < -32767.0f) return -32767;
     return (int16_t)v;
+}
+
+/* Soft int16 clamp for signal-path values already in int16 scale (recirc
+ * feedback writes, final output). Same knee as soft_saturate_q15. */
+static inline int16_t soft_clip_int16(float v)
+{
+    return (int16_t)(soft_clip_unit(v * (1.0f / 32768.0f)) * 32767.0f);
 }
 
 /* ==== Per-block effGains recompute (ladder-driven) ====
@@ -1352,9 +1593,9 @@ static void update_morph_state(void)
     /* Per-stage recirc mod depths in samples — proportional to each stage's
      * window so the same % setting produces a consistent feel across T0/T1/T2. */
     float mod_frac = reverb_recirc_mod_depth_pct * 0.01f;
-    t0_rc_mod_depth_samples = mod_frac * t0_window_morph;
-    t1_rc_mod_depth_samples = mod_frac * t1_window_morph;
-    t2_rc_mod_depth_samples = mod_frac * t2_window_morph;
+    t0_rc_mod_depth_samples = fmaxf(mod_frac * t0_window_morph, RECIRC_MOD_DEPTH_MIN_SAMPLES);
+    t1_rc_mod_depth_samples = fmaxf(mod_frac * t1_window_morph, RECIRC_MOD_DEPTH_MIN_SAMPLES);
+    t2_rc_mod_depth_samples = fmaxf(mod_frac * t2_window_morph, RECIRC_MOD_DEPTH_MIN_SAMPLES);
 }
 
 /* ==== Background effGains recompute (outside the block timer) ====
@@ -1453,9 +1694,11 @@ static void background_eff_gains_update(void)
 
 static void do_input_write_t0(void)
 {
+    /* Attenuate the input into the cascade by REVERB_HEADROOM so the whole
+     * int16 chain runs cooler; the output stage makes it back up. */
     for (int i = 0; i < REVERB_BLOCK; i++) {
         uint32_t wi = ring_write_idx + (uint32_t)i;
-        t0_ring[wi & T0_RING_MASK] = input_ready[i];
+        t0_ring[wi & T0_RING_MASK] = (int16_t)((float)input_ready[i] * REVERB_HEADROOM);
     }
     block_write_idx = ring_write_idx;
     ring_write_idx += REVERB_BLOCK;
@@ -1543,10 +1786,13 @@ static void do_t0_recirc(void)
         }
         rcSum *= invW;
         recirc_damp_t0 += recirc_damp_coeff * (rcSum - recirc_damp_t0);
+        float shelf = recirc_damp_t0 + reverb_recirc_damp_hf_gain * (rcSum - recirc_damp_t0);
+        recirc_hp_t0 += recirc_hp_coeff * (shelf - recirc_hp_t0);
+        float fb = shelf - recirc_hp_t0;   /* high-shelf damping + 100 Hz HPF */
 
         uint32_t wi = (block_write_idx + (uint32_t)n) & T0_RING_MASK;
         float current = (float)t0_ring[wi];
-        t0_ring[wi] = clamp_f_to_int16(current + amt * recirc_damp_t0);
+        t0_ring[wi] = soft_clip_int16(current + amt * fb);
     }
 }
 
@@ -1631,10 +1877,13 @@ static void do_t1_recirc(void)
         }
         rcSum *= invW;
         recirc_damp_t1 += recirc_damp_coeff * (rcSum - recirc_damp_t1);
+        float shelf = recirc_damp_t1 + reverb_recirc_damp_hf_gain * (rcSum - recirc_damp_t1);
+        recirc_hp_t1 += recirc_hp_coeff * (shelf - recirc_hp_t1);
+        float fb = shelf - recirc_hp_t1;   /* high-shelf damping + 100 Hz HPF */
 
         uint32_t wi = (block_write_idx + (uint32_t)n) & T1_RING_MASK;
         float current = (float)t1_ring[wi];
-        t1_ring[wi] = clamp_f_to_int16(current + amt * recirc_damp_t1);
+        t1_ring[wi] = soft_clip_int16(current + amt * fb);
     }
 }
 
@@ -1650,10 +1899,32 @@ static void do_bridge_t1_to_t2(void)
     for (int i = 0; i < REVERB_BLOCK; i++) { accL[i] = 0; accR[i] = 0; }
 }
 
+/* Largest T2 effective tap offset that still carries audible energy (effGain
+ * within ~5% of the loudest tap), updated each block by do_t2_phase. The global
+ * recirc bounds its read delays to this so it overlaps the real tail instead of
+ * reading past the last active tap (a distinct echo when T2 density/decay shrinks
+ * the tail). 1-block latency (global recirc runs before do_t2_phase). */
+static float t2_active_extent = 0.0f;
+
 static void do_t2_phase(void)
 {
     int count = t2TapCount;
-    if (count == 0) return;
+    if (count == 0) { t2_active_extent = 0.0f; return; }
+
+    /* Active tail extent for the global recirc (relative-to-loudest threshold so
+     * it tracks density-fade and the decay envelope, both folded into effGains). */
+    int32_t maxg = 0;
+    for (int t = 0; t < count; t++) {
+        int32_t g = effGains_t2[t]; if (g < 0) g = -g;
+        if (g > maxg) maxg = g;
+    }
+    int32_t thr = maxg / 20;   /* 5% of the loudest tap */
+    uint32_t ext = 0;
+    for (int t = 0; t < count; t++) {
+        int32_t g = effGains_t2[t]; if (g < 0) g = -g;
+        if (g > thr && (uint32_t)effOffT2L[t] > ext) ext = (uint32_t)effOffT2L[t];
+    }
+    t2_active_extent = (float)ext;
 
     /* === L pass === */
     dma_buf_idx = 0;
@@ -1706,8 +1977,8 @@ static void do_t2_phase(void)
  * insertion point. Pregain drives the tanh; postgain trims the result.
  * Values are hardcoded to the user's chosen 2.0 / 0.5; expose as globals
  * later if they need to tweak. */
-#define SAT_PRE_T2_PREGAIN   2.0f
-#define SAT_PRE_T2_POSTGAIN  0.5f
+#define SAT_PRE_T2_PREGAIN   1.1f
+#define SAT_PRE_T2_POSTGAIN  1.05f
 
 /* Padé(3,2) approximation of tanh: x(27 + x²) / (27 + 9x²).
  * Accurate to <0.001 for |x| ≤ 2 (well below audible). Asymptotes to ±1/3 ×
@@ -1724,9 +1995,12 @@ static void apply_pre_t2_sat(void)
 {
     const float scale_in  = 1.0f / 32768.0f;
     const float scale_out = 32768.0f;
-    /* Hoist the pregain×scale_in product into a single multiply per sample. */
-    const float in_gain  = SAT_PRE_T2_PREGAIN * scale_in;
-    const float out_gain = SAT_PRE_T2_POSTGAIN * scale_out;
+    /* Hoist the pregain×scale_in product into a single multiply per sample.
+     * The /HEADROOM on in_gain and ×HEADROOM on out_gain cancel the internal
+     * headroom scaling for this stage only, so the tanh sees the same drive and
+     * the saturation character is unchanged while the ring stays cooled. */
+    const float in_gain  = SAT_PRE_T2_PREGAIN * scale_in * REVERB_OUT_MAKEUP;
+    const float out_gain = SAT_PRE_T2_POSTGAIN * scale_out * REVERB_HEADROOM;
     for (int n = 0; n < REVERB_BLOCK; n++) {
         uint32_t wi = (block_write_idx + (uint32_t)n) & T2_RING_MASK;
         float v = (float)t2_ring[wi] * in_gain;
@@ -1793,10 +2067,88 @@ static void do_t2_recirc(void)
         }
         /* gn already folded invW, so rcSum is already weighted-averaged. */
         recirc_damp_t2 += recirc_damp_coeff * (rcSum - recirc_damp_t2);
+        float shelf = recirc_damp_t2 + reverb_recirc_damp_hf_gain * (rcSum - recirc_damp_t2);
+        recirc_hp_t2 += recirc_hp_coeff * (shelf - recirc_hp_t2);
+        float fb = shelf - recirc_hp_t2;   /* high-shelf damping + 100 Hz HPF */
 
         uint32_t wi = (block_write_idx + (uint32_t)n) & T2_RING_MASK;
         float current = (float)t2_ring[wi];
-        t2_ring[wi] = clamp_f_to_int16(current + amt * recirc_damp_t2);
+        t2_ring[wi] = soft_clip_int16(current + amt * fb);
+    }
+}
+
+/* ==== Global recirculation (T2 tail -> T0 input) ====
+ *
+ * Reads GLOBAL_RECIRC_TAPS modulated, interpolated taps from deep in the T2
+ * ring (fixed fractions of the current T2 window, so the loop delay tracks the
+ * reverb size), one-pole damps the weighted average, and mixes it into the
+ * fresh T0 input block. Forms a long T0->T1->T2->T0 feedback loop on top of the
+ * per-stage recirc — the global "size"/sustain control.
+ *
+ * Runs after do_input_write_t0 (t0_ring fresh block written, block_write_idx
+ * set) and before do_t0_phase, so T0 convolves the augmented input. t2_ring
+ * holds the previous block's tail (T2 for this block runs later in poll), so
+ * this is a 1-block-delayed feedback like the per-stage recircs.
+ *
+ * Both rings run at REVERB_HEADROOM level, so no extra headroom scaling is
+ * needed — amt is a pure ratio. Mod uses the recirc LFO slots above the
+ * per-stage taps; depth reuses t2_rc_mod_depth_samples (scales with T2 window). */
+/* Fractions of the active-tail extent at which the global taps read. Clustered
+ * near the END so the loop delay ≈ the tail length (each feedback pass appends
+ * one tail-length: smooth extension) rather than mid-tail (overlap → ringing) or
+ * past the last tap (echo). */
+static const float global_recirc_frac[GLOBAL_RECIRC_TAPS] = { 0.85f, 0.93f, 1.0f };
+
+static void do_global_recirc(void)
+{
+    float amt = reverb_global_recirc;
+    if (amt > RECIRC_AMOUNT_CLAMP) amt = RECIRC_AMOUNT_CLAMP;
+    if (amt <= 0.0f) return;
+
+    const int base_idx = T0_RECIRC_TAPS + T1_RECIRC_TAPS + T2_RECIRC_TAPS;
+    const float invN = 1.0f / (float)GLOBAL_RECIRC_TAPS;
+
+    /* Loop length ≈ active tail extent (so the 1.0 tap reads at the last active
+     * tap, not past it → no echo), floored at the T1 window so a tiny tail can't
+     * collapse the loop into an audible comb. Uses last block's extent. */
+    float gExtent = (t2_active_extent > t1_window_morph) ? t2_active_extent : t1_window_morph;
+
+    int32_t iBase [GLOBAL_RECIRC_TAPS];
+    float   frac  [GLOBAL_RECIRC_TAPS];
+    float   prev_a[GLOBAL_RECIRC_TAPS];
+    for (int r = 0; r < GLOBAL_RECIRC_TAPS; r++) {
+        int pidx = base_idx + r;
+        recirc_mod_phases[pidx] += recirc_mod_rates[pidx] * (float)REVERB_BLOCK;
+        if (recirc_mod_phases[pidx] >  PI_F) recirc_mod_phases[pidx] -= TWO_PI_F;
+        if (recirc_mod_phases[pidx] < -PI_F) recirc_mod_phases[pidx] += TWO_PI_F;
+        float baseOff = global_recirc_frac[r] * gExtent;
+        float modOff  = baseOff + t2_rc_mod_depth_samples * triWave(recirc_mod_phases[pidx]);
+        if (modOff < (float)TAP_MIN_OFFSET) modOff = (float)TAP_MIN_OFFSET;
+        float pos0 = (float)block_write_idx - modOff;
+        int32_t iP = (int32_t)floorf(pos0);
+        iBase[r]   = iP;
+        frac [r]   = pos0 - (float)iP;
+        prev_a[r]  = (float)t2_ring[((uint32_t)iP) & T2_RING_MASK];
+    }
+
+    for (int n = 0; n < REVERB_BLOCK; n++) {
+        float rcSum = 0.0f;
+        for (int r = 0; r < GLOBAL_RECIRC_TAPS; r++) {
+            uint32_t idx1 = ((uint32_t)(iBase[r] + n + 1)) & T2_RING_MASK;
+            float a = prev_a[r];
+            float b = (float)t2_ring[idx1];
+            rcSum += (a + frac[r] * (b - a));
+            prev_a[r] = b;
+        }
+        rcSum *= invN;
+        recirc_damp_global += recirc_damp_coeff * (rcSum - recirc_damp_global);
+        float shelf = recirc_damp_global + reverb_recirc_damp_hf_gain * (rcSum - recirc_damp_global);
+        recirc_hp_global += recirc_hp_coeff * (shelf - recirc_hp_global);
+        float fb = shelf - recirc_hp_global;   /* high-shelf damping + 100 Hz HPF */
+
+        uint32_t wi = (block_write_idx + (uint32_t)n) & T0_RING_MASK;
+        float current = (float)t0_ring[wi];
+        t0_ring[wi] = soft_clip_int16(current + amt * fb);
     }
 }
 
@@ -1827,19 +2179,31 @@ static void do_finalize(void)
     uint8_t write_buf = (uint8_t)(output_buffer_id ^ 1);
     int16_t *wL = outL[write_buf];
     int16_t *wR = outR[write_buf];
-    int16_t pL = prev_out_L;
-    int16_t pR = prev_out_R;
+    float pL = prev_out_L;
+    float pR = prev_out_R;
 
     for (int i = 0; i < REVERB_BLOCK; i++) {
-        int16_t curL = soft_saturate_q15(accL[i]);
-        int16_t curR = soft_saturate_q15(accR[i]);
+        /* Mid-side stereo width on the reverb-rate stereo pair, applied before
+         * the 2x upsample interp so the interpolated sample, the original
+         * sample, and the carried-over prev all stay width-consistent. The
+         * widened side can exceed int16, but the biquad output clamp handles
+         * the final range. */
+        /* Make up the internal headroom here (the input was attenuated by
+         * REVERB_HEADROOM). soft_saturate_q15 soft-clips the cooled accumulator
+         * at full scale first, so the makeup can't reintroduce a hard over. */
+        float rawL = (float)soft_saturate_q15(accL[i]) * REVERB_OUT_MAKEUP;
+        float rawR = (float)soft_saturate_q15(accR[i]) * REVERB_OUT_MAKEUP;
+        float m = 0.5f * (rawL + rawR);
+        float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
+        float curL = m + s;
+        float curR = m - s;
 
-        float midL = ((float)pL + (float)curL) * 0.5f;
-        float midR = ((float)pR + (float)curR) * 0.5f;
-        wL[2 * i]     = clamp_f_to_int16(biquad_process(&lpf_L, biquad_process(&hpf_L, midL)));
-        wR[2 * i]     = clamp_f_to_int16(biquad_process(&lpf_R, biquad_process(&hpf_R, midR)));
-        wL[2 * i + 1] = clamp_f_to_int16(biquad_process(&lpf_L, biquad_process(&hpf_L, (float)curL)));
-        wR[2 * i + 1] = clamp_f_to_int16(biquad_process(&lpf_R, biquad_process(&hpf_R, (float)curR)));
+        float midL = (pL + curL) * 0.5f;
+        float midR = (pR + curR) * 0.5f;
+        wL[2 * i]     = soft_clip_int16(biquad_process(&lpf_L, biquad_process(&hpf_L, midL)));
+        wR[2 * i]     = soft_clip_int16(biquad_process(&lpf_R, biquad_process(&hpf_R, midR)));
+        wL[2 * i + 1] = soft_clip_int16(biquad_process(&lpf_L, biquad_process(&hpf_L, curL)));
+        wR[2 * i + 1] = soft_clip_int16(biquad_process(&lpf_R, biquad_process(&hpf_R, curR)));
 
         pL = curL;
         pR = curR;
@@ -1911,6 +2275,11 @@ void velvet_reverb_poll(void)
 
 #if REVERB_STAGE >= 1
     do_input_write_t0();
+#endif
+#if REVERB_STAGE >= 3
+    /* Global T2->T0 feedback, injected into the fresh T0 input before T0 conv.
+     * Reads last block's T2 tail (T2 for this block runs further down). */
+    do_global_recirc();
 #endif
 #if REVERB_STAGE >= 2
     {
