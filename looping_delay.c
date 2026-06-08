@@ -655,6 +655,9 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	 * knob controls how hard the reverb is driven (and therefore the
 	 * audible reverb amount, but only via the tail's own input level). */
 	const int32_t send_q15 = (int32_t)(reverb_send * 32768.0f);
+	/* Top 10% of the right MIX pot fades the dry+delay path out (set by
+	 * params.c), so at max the output is 100% wet reverb. */
+	const int32_t dry_gain_q15 = (int32_t)(reverb_dry_gain * 32768.0f);
 
 	uint16_t i,t;
 	uint16_t topbyte, bottombyte;
@@ -978,6 +981,10 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			} else {
 				rev_s = velvet_reverb_out_right();
 			}
+			/* Fade the dry+delay path out over the top 10% of the right MIX
+			 * pot. Reverb is fed the un-faded mix above, so at max knob the
+			 * output is 100% wet reverb (mix→0, rev_s unchanged). */
+			mix = (mix * dry_gain_q15) >> 15;
 			mix += rev_s;
 			if (SAMPLESIZE==2)
 				asm("ssat %[dst], #16, %[src]" : [dst] "=r" (mix) : [src] "r" (mix));

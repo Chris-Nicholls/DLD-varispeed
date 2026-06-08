@@ -640,6 +640,18 @@ void update_params(void)
 		}
 		reverb_send = epp_lut[4095 - t];
 
+		/* Last 10% of the right MIX pot fades the dry+delay signal out so
+		 * that at max the output is 100% wet reverb. Below 90% the dry path
+		 * is unaffected; from 90%→100% it ramps linearly to 0. */
+		{
+			const int32_t fade_start = (4095 * 9) / 10;   /* 3685 */
+			if (t <= fade_start) {
+				reverb_dry_gain = 1.0f;
+			} else {
+				reverb_dry_gain = (float)(4095 - t) * (1.0f / (float)(4095 - fade_start));
+			}
+		}
+
 		/* Left LEVEL / REGEN / MIX drive both delay channels. With the
 		 * loop body's writes to param[1] guarded out, this slaving is the
 		 * ONLY place param[1][LEVEL/REGEN/MIX_DRY/MIX_WET] gets set — no
