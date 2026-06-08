@@ -155,14 +155,16 @@
 /************************* PLL Parameters *************************************/
 /* PLL_VCO = (HSE_VALUE or HSI_VALUE / PLL_M) * PLL_N */
 #define PLL_M      8
-/* Operating at 168 MHz. 175/180 MHz both reproducibly cause signal-
- * proportional channel-1 clicks at the loop rate; root cause not isolated
- * (ruled out: SDRAM refresh, SDRAM timing margin, FLASH wait-state margin,
- * codec_BUFF_LEN sizing, reverb code, looping_delay code). Likely a
- * hardware-level marginality at >168 MHz that we can't easily work around. */
-//#define PLL_N      360   /* 180 MHz — clicks */
+/* Operating at 180 MHz for reverb CPU headroom (overdrive + 5WS already
+ * configured in SetSysClock below; SystemCoreClock = 180000000 is correct here).
+ * CAVEAT: 175/180 MHz previously showed signal-proportional channel-1 clicks at
+ * the loop rate; root cause never isolated (ruled out: SDRAM refresh, SDRAM
+ * timing margin, FLASH wait-state margin, codec_BUFF_LEN sizing, reverb code,
+ * looping_delay code) — possibly a hardware marginality >168 MHz. Drop back to
+ * PLL_N=336 (168 MHz, stable) if those clicks return. */
+#define PLL_N      360     /* 180 MHz — more CPU; watch for ch-1 clicks */
 //#define PLL_N      350   /* 175 MHz — clicks */
-#define PLL_N      336     /* 168 MHz — stable */
+//#define PLL_N      336   /* 168 MHz — stable */
 
 /* SYSCLK = PLL_VCO / PLL_P */
 #define PLL_P      2
@@ -448,9 +450,10 @@ static void SetSysClock(void)
     }
 
     /* Configure Flash prefetch, Instruction cache, Data cache and wait state.
-     * 5WS is correct for 168 MHz. PRFTEN reverted — added during the 180 MHz
-     * investigation, may interact poorly with ART/I-cache at 168 (suspected
-     * cause of clicks returning after the investigation). HEAD had it off. */
+     * 5WS is correct for both 168 and 180 MHz (150 < HCLK <= 180 @ 2.7-3.6V).
+     * PRFTEN deliberately OFF — it was tried during the 180 MHz investigation
+     * and suspected of interacting poorly with ART/I-cache (clicks). Leave off
+     * unless re-investigating the 180 MHz clicks. */
     FLASH->ACR = FLASH_ACR_ICEN | FLASH_ACR_DCEN | FLASH_ACR_LATENCY_5WS;
 
     /* Select the main PLL as system clock source */
