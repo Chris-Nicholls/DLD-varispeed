@@ -33,12 +33,14 @@ volatile uint32_t diag_thresh_cycles[DIAG_EVT_COUNT] = {
     [DIAG_EVT_REVERB_MORPH]     = 3600u,
     [DIAG_EVT_REVERB_FINALIZE]  = 3600u,
     [DIAG_EVT_REVERB_BG_EFF]    = 3600u,
-    [DIAG_EVT_REVERB_T0_RECIRC] = 3600u,
-    [DIAG_EVT_REVERB_T1_RECIRC] = 3600u,
-    [DIAG_EVT_REVERB_T2_RECIRC] = 3600u,
-    [DIAG_EVT_RESERVED_13]      = 0xFFFFFu,
-    [DIAG_EVT_RESERVED_14]      = 0xFFFFFu,
-    [DIAG_EVT_RESERVED_15]      = 0xFFFFFu,
+    [DIAG_EVT_REVERB_PREDELAY]  = 3600u,   /* > ~21 µs (pre-delay sustain engine) */
+    [DIAG_EVT_REVERB_ISR_IN_BLOCK] = 0u,   /* always log: ISR preemption per block */
+    [DIAG_EVT_ISR_SDRAM_READ]   = 0u,      /* always log: SDRAM read time per ISR call */
+    [DIAG_EVT_ISR_SDRAM_WRITE]  = 0u,      /* always log: SDRAM write time per ISR call */
+    [DIAG_EVT_OUTPUT_MISS]      = 0u,      /* always log (emitted ~1/s): cumulative bitcrush miss count */
+    [DIAG_EVT_POLL_LATENCY]     = 0u,      /* always log: block_ready->poll latency */
 };
 
 volatile uint8_t diag_log_enabled = 1;
+
+volatile uint32_t diag_isr_cycles = 0u;

@@ -4,18 +4,18 @@
  * Architecture: three-stage cascade (T0 → T1 → T2) at half codec rate
  * (24 kHz), processed from the main loop in 16-sample blocks.
  *
- *   T0: short window (≤ 200 ms), CCM ring, mono — early reflections
+ *   T0: short window (≤ 80 ms), CCM ring, mono — early reflections
  *   T1: medium window (≤ 666 ms), CCM ring, mono — middle scattering
  *   T2: long window (≤ 8 s), SDRAM ring + DMA prefetch, stereo (via
  *       independent L/R read offsets with shared gain magnitude)
  *
- * Per-stage features (all dynamically tunable at runtime via the
- * reverb_*_target_* globals — see below):
- *   - Tap count (with smooth density morph via tap-survival rank)
- *   - Window / duration (with smooth fade at the moving edge)
+ * Per-stage features:
+ *   - Tap count fixed at MAX (density is not a control)
+ *   - Window / duration (relocation ladder migrates taps as it shrinks)
  *   - Decay envelope (exp↔linear blend) for T1 and T2
- *   - Recirculation amount: 2 taps on T0/T1, 3 taps on T2, with LFO
- *     modulation of read positions (anti-comb) and one-pole damping LPF
+ *   - A pre-delay sustain engine (two modulated, damped feedback delay lines)
+ *     sits in front of the cascade and supplies the long tail; the cascade
+ *     itself runs purely feedforward. T0 also gets a per-tap Lexicon LFO.
  *
  * Output chain: stereo HPF + LPF biquads at the codec rate; the LPF also
  * doubles as the reconstruction filter for the 2:1 linear-interp upsample.
@@ -52,13 +52,42 @@ extern int16_t host_t2_ring_storage[T2_RING_SAMPLES];
 #endif
 #define T2_RING_MASK     (T2_RING_SAMPLES - 1)
 
-#define T0_RING_SAMPLES  8192UL
+/* T0 window is capped at 80 ms by the macro (≈1920 samples @ 24 kHz); the
+ * deepest read is window + tap-LFO swing (~120) ≈ 2040 back. 4096 (171 ms)
+ * gives >2x margin and frees 8 KB CCM vs the old 8192. */
+#define T0_RING_SAMPLES  4096UL
 #define T0_RING_MASK     (T0_RING_SAMPLES - 1)
 
 #define T1_RING_SAMPLES  16384UL
 #define T1_RING_MASK     (T1_RING_SAMPLES - 1)
 
-#define REVERB_SDRAM_RESERVE  (T2_RING_SAMPLES * 2)
+/* ---- Pre-delay sustain-engine lines ----
+ * Two modulated, damped feedback delay lines sit IN FRONT of the velvet
+ * cascade (replacing the old per-stage/global recirculation). They store
+ * float samples (normalised ±1, node-clamped ±4) so the high-feedback loop
+ * doesn't accumulate int16 quantisation noise. Placed in SDRAM just below
+ * the T2 ring (reserved together via REVERB_SDRAM_RESERVE), since 2×64 KB
+ * doesn't fit the ~9 KB of free CCM. Line length is a power of two so the
+ * read/write wraps are a cheap mask; it covers PRE_DELAY_MAX + 2×PRE_MOD. */
+#define PRE_DELAY_LINE_SAMPLES  16384UL
+#define PRE_DELAY_LINE_MASK     (PRE_DELAY_LINE_SAMPLES - 1)
+#define PRE_DELAY_MAX_SAMPLES   12000   /* 0.5 s @ 24 kHz (firmware cap; JS = 1 s) */
+#define PRE_MOD_MAX_SAMPLES     720     /* 0.030 s @ 24 kHz (depth = 1 swing) */
+
+#ifdef VELVET_REVERB_HOST
+extern float host_predelay_a_storage[PRE_DELAY_LINE_SAMPLES];
+extern float host_predelay_b_storage[PRE_DELAY_LINE_SAMPLES];
+#define PRE_DELAY_A_BASE  ((uintptr_t)host_predelay_a_storage)
+#define PRE_DELAY_B_BASE  ((uintptr_t)host_predelay_b_storage)
+#else
+/* Two float lines directly below the T2 ring: A then B, contiguous. */
+#define PRE_DELAY_A_BASE  (T2_RING_BASE - 2UL * PRE_DELAY_LINE_SAMPLES * 4UL)
+#define PRE_DELAY_B_BASE  (T2_RING_BASE - 1UL * PRE_DELAY_LINE_SAMPLES * 4UL)
+#endif
+
+/* Reserve = T2 ring (int16) + both pre-delay lines (float), so channel 1's
+ * write head stops at PRE_DELAY_A_BASE (below the whole reverb region). */
+#define REVERB_SDRAM_RESERVE  (T2_RING_SAMPLES * 2UL + 2UL * PRE_DELAY_LINE_SAMPLES * 4UL)
 
 /* ---- Block geometry ---- */
 #define REVERB_BLOCK         16
@@ -96,18 +125,19 @@ extern int16_t host_t2_ring_storage[T2_RING_SAMPLES];
 /* ---- Tap arrays (always generated at MAX count + MAX window; runtime
  *      morphing decides how many of them are active and how far the
  *      window extends.) ---- */
+/* Density is fixed at MAX (all taps always active — there is no Density
+ * control), so the per-tap removal-rank arrays are gone. Each stage always
+ * generates MAX taps once at init; the relocation ladder still migrates them
+ * one-at-a-time as the Decay-driven window shrinks. */
 extern uint32_t t0TapOffsets[MAX_T0_TAPS];
 extern int16_t  t0TapGains [MAX_T0_TAPS];   /* base gain incl. taper (no envelope, no comp) */
-extern float    t0TapRanks [MAX_T0_TAPS];   /* removal-order rank (lower = kept longer) */
 
 extern uint32_t t1TapOffsets[MAX_T1_TAPS];
 extern int16_t  t1TapGains [MAX_T1_TAPS];
-extern float    t1TapRanks [MAX_T1_TAPS];
 
 extern uint32_t t2TapOffsetsL[MAX_T2_TAPS];
 extern uint32_t t2TapOffsetsR[MAX_T2_TAPS];
 extern int16_t  t2TapGains   [MAX_T2_TAPS];
-extern float    t2TapRanks   [MAX_T2_TAPS];
 
 /* ---- Mutable runtime globals ----
  *
@@ -132,20 +162,7 @@ extern float reverb_dry_gain;
 extern float reverb_lpf_hz;
 extern float reverb_hpf_hz;
 
-/* Per-stage recirculation amount (clamped to 0.85 in DSP for stability) */
-extern float reverb_t0_recirc;
-extern float reverb_t1_recirc;
-extern float reverb_t2_recirc;
-
-/* Global recirculation amount: T2 tail → T0 input feedback loop (0..clamp). */
-extern float reverb_global_recirc;
-
-/* Per-stage active-tap count target (0..MAX_T{N}_TAPS, fractional allowed) */
-extern float reverb_t0_count_target;
-extern float reverb_t1_count_target;
-extern float reverb_t2_count_target;
-
-/* Per-stage window/duration target */
+/* Per-stage window/duration target (driven by the Decay macro) */
 extern float reverb_t0_window_ms_target;     /* 0..~200 */
 extern float reverb_t1_window_ms_target;     /* 0..~666 */
 extern float reverb_t2_duration_s_target;    /* 0..~8 */
@@ -154,11 +171,26 @@ extern float reverb_t2_duration_s_target;    /* 0..~8 */
 extern float reverb_t1_decay_shape;
 extern float reverb_t2_decay_shape;
 
-/* Recirc mod depth as percent of each stage's window (~0..5 typical). */
-extern float reverb_recirc_mod_depth_pct;
+/* ---- Pre-delay sustain engine (replaces recirculation) ----
+ * Two feedback delay lines A/B with one shared loop gain, shared low/high
+ * shelves (tone + damping), per-line modulation, ~12 Hz DC block, input
+ * ducking, and a dry/wet crossfade into the cascade. JS-matched defaults. */
+extern float reverb_feedback;            /* shared loop gain (clamped 0.999) */
+extern float reverb_predelay_a_s;        /* line A delay time, seconds */
+extern float reverb_predelay_b_s;        /* line B delay time, seconds */
+extern float reverb_delay_mix;           /* 0 = dry input, 1 = full pre-delay output */
+extern float reverb_fb_low_shelf_hz;
+extern float reverb_fb_low_shelf_db;
+extern float reverb_fb_high_shelf_hz;
+extern float reverb_fb_high_shelf_db;
+extern float reverb_fb_mod_depth;        /* 0..1 (× PRE_MOD_MAX_SAMPLES) */
+extern float reverb_fb_mod_rate;         /* Hz */
+extern float reverb_duck_amount;         /* 0..1 max feedback reduction */
+extern float reverb_duck_release_s;      /* seconds */
 
-/* Feedback high-shelf damping: 0 = full LP damping, 1 = none (HF decay ratio). */
-extern float reverb_recirc_damp_hf_gain;
+/* T0 (early-reflection) per-tap Lexicon LFO — golden-angle decorrelated. */
+extern float reverb_t0_tap_mod_depth;    /* 0..1 (× ~5 ms swing) */
+extern float reverb_t0_tap_mod_rate;     /* Hz */
 
 /* ---- API ---- */
 void velvet_reverb_init(void);
@@ -179,10 +211,9 @@ void velvet_reverb_poll(void);
  * the param's bounds.
  *
  * Bounds + mappings mirror the JS prototype's velvet_param_bounds /
- * velvet_macros snapshot; baked-in here. Density is driven by the right
- * channel's LEVEL pot, Decay by the right REGEN pot (see params.c). Tone
- * has no hardware knob — set via velvet_reverb_apply_tone_macro(). */
-void velvet_reverb_apply_density_macro(float v);
+ * velvet_macros snapshot; baked-in here. Density has been retired (density is
+ * fixed at MAX), so the right LEVEL pot now drives Tone and Decay is driven by
+ * the right REGEN pot (see params.c). */
 void velvet_reverb_apply_decay_macro  (float v);
 void velvet_reverb_apply_tone_macro   (float v);
 void velvet_reverb_recompute_macros   (void);

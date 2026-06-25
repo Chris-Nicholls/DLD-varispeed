@@ -59,8 +59,8 @@
 
 #define TRIG_TIME 400
 
-#define AUTO_MUTE_ATTACK .02
-#define AUTO_MUTE_DECAY .02
+#define AUTO_MUTE_ATTACK .02f
+#define AUTO_MUTE_DECAY .02f
 
 //#define USE_VCXO
 

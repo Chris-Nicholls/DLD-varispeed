@@ -155,10 +155,7 @@ void audio_buffer_init(void)
 		doing_reverse_fade[i]=0;
 	}
 
-	/* Auto-mute LPF coef. 4× the original 0.0002 to compensate for running
-	 * the LPF only on the 0th sample of each ISR (decimation 1-of-4). The
-	 * effective time constant in real-time samples stays unchanged. */
-	lpf_coef = 0.0008;
+	lpf_coef = 0.0002;
 
 	if (SAMPLESIZE==2)
 	{
@@ -416,10 +413,19 @@ void set_divmult_time(uint8_t channel){
 		// Convert to samples
 		int32_t distance_samples = distance / SAMPLESIZE;
 		
-		// Set target speed based on distance
-		if (distance_samples > 8) {
+		// Set target speed based on distance.
+		//
+		// The trigger threshold MUST match the ISR snap deadband
+		// (buffer_samples = sz/2 = codec_BUFF_LEN/4). The ISR snaps read_speed
+		// back to 1x whenever |distance| <= that deadband, which leaves a
+		// residual offset of up to deadband samples after every settle. If this
+		// trigger threshold were smaller than the deadband, that harmless
+		// residual would re-trigger catch-up every time set_divmult_time runs
+		// (e.g. on TIME-pot smoothing noise), producing spurious varispeed.
+		const int32_t catchup_deadband = codec_BUFF_LEN / 4;
+		if (distance_samples > catchup_deadband) {
 			target_read_speed[channel] = 2.0f;  // Speed up to catch up
-		} else if (distance_samples < -8) {
+		} else if (distance_samples < -catchup_deadband) {
 			target_read_speed[channel] = 0.5f;  // Slow down
 		} else {
 			target_read_speed[channel] = 1.0f;  // Close enough
@@ -715,6 +721,14 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	// reversed direction, so we should continue reading from rd_buff in the same direction (which is now !REV),
 	// and cross fade towards dest_rd_buff being read in the direction of REV
 
+#ifdef DIAG_FSK_ENABLE
+	uint32_t _rd_t0 = DWT->CYCCNT;
+#endif
+#ifdef DIAG_BYPASS_DELAY
+	/* Diagnostic isolation: skip the SDRAM read + varispeed entirely. The
+	 * delay output (rd) is unused below when bypassed; reverb still runs. */
+	crossed_start_fade_addr = 0;
+#else
 	if (mode[channel][INF] == INF_OFF) {
 		// Calculate distance to target
 		int32_t distance = (int32_t)target_read_addr[channel] - (int32_t)read_addr[channel];
@@ -752,6 +766,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		// Freeze modes: use original memory_read
 		crossed_start_fade_addr = memory_read(read_addr, channel, rd_buff, sz/2, start_fade_addr, doing_reverse_fade[channel]);
 	}
+#endif /* DIAG_BYPASS_DELAY */
 
 
 	if (mode[channel][INF]!=INF_OFF && crossed_start_fade_addr)
@@ -798,9 +813,15 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	}
 
 	// Read crossfade destination buffer (only needed for freeze modes, not varispeed)
+#ifndef DIAG_BYPASS_DELAY
 	if (mode[channel][INF] != INF_OFF) {
 		memory_read(fade_dest_read_addr, channel, rd_buff_dest, sz/2, 0, 0 /* + mode[channel][CONTINUOUS_REVERSE]*/);
 	}
+#endif
+
+#ifdef DIAG_FSK_ENABLE
+	diag_log(DIAG_EVT_ISR_SDRAM_READ, DWT->CYCCNT - _rd_t0);
+#endif
 
 	for (i=0;i<(sz/2);i++){
 
@@ -835,35 +856,27 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		}
 
 		if (global_mode[AUTO_MUTE]){
-			/* Heavy part (LPF + state transitions) runs on i==0 only —
-			 * 1-of-4 decimation. lpf_coef was scaled ×4 in
-			 * audio_buffer_init to keep the same effective time constant.
-			 * Fade increment + apply still run per sample so transitions
-			 * are smooth. */
-			if (i == 0) {
-				mainin_lpf[channel] = (mainin_lpf[channel]*(1.0-lpf_coef)) + (((mainin>0)?mainin:(-1*mainin))*lpf_coef);
-				if (mainin_lpf[channel]<min_vol && (auto_muting_main_state[channel] == FADING_UP || auto_muting_main_state[channel]==UNMUTED))
-					auto_muting_main_state[channel] =  FADING_DOWN;
-				if (mainin_lpf[channel]>=min_vol && (auto_muting_main_state[channel] == FADING_DOWN || auto_muting_main_state[channel]==MUTED))
-					auto_muting_main_state[channel] =  FADING_UP;
+			mainin_lpf[channel] = (mainin_lpf[channel]*(1.0f-lpf_coef)) + (((mainin>0)?mainin:(-1*mainin))*lpf_coef);
+			if (mainin_lpf[channel]<min_vol && (auto_muting_main_state[channel] == FADING_UP || auto_muting_main_state[channel]==UNMUTED))
+				auto_muting_main_state[channel] =  FADING_DOWN;
+			if (mainin_lpf[channel]>=min_vol && (auto_muting_main_state[channel] == FADING_DOWN || auto_muting_main_state[channel]==MUTED))
+				auto_muting_main_state[channel] =  FADING_UP;
 
-				auxin_lpf[channel] = (auxin_lpf[channel]*(1.0-lpf_coef)) + (((auxin>0)?auxin:(-1*auxin))*lpf_coef);
-				if (auxin_lpf[channel]<min_vol && (auto_muting_aux_state[channel] == FADING_UP || auto_muting_aux_state[channel]==UNMUTED))
-					auto_muting_aux_state[channel] =  FADING_DOWN;
-				if (auxin_lpf[channel]>=min_vol && (auto_muting_aux_state[channel] == FADING_DOWN || auto_muting_aux_state[channel]==MUTED))
-					auto_muting_aux_state[channel] =  FADING_UP;
-			}
+			auxin_lpf[channel] = (auxin_lpf[channel]*(1.0f-lpf_coef)) + (((auxin>0)?auxin:(-1*auxin))*lpf_coef);
+			if (auxin_lpf[channel]<min_vol && (auto_muting_aux_state[channel] == FADING_UP || auto_muting_aux_state[channel]==UNMUTED))
+				auto_muting_aux_state[channel] =  FADING_DOWN;
+			if (auxin_lpf[channel]>=min_vol && (auto_muting_aux_state[channel] == FADING_DOWN || auto_muting_aux_state[channel]==MUTED))
+				auto_muting_aux_state[channel] =  FADING_UP;
 
-			/* Per-sample fade increment + terminate + apply. */
 			if (auto_muting_main_state[channel] == FADING_DOWN)
 				auto_muting_main_fade[channel] -= AUTO_MUTE_DECAY;
 			else if (auto_muting_main_state[channel] == FADING_UP)
 				auto_muting_main_fade[channel] += AUTO_MUTE_ATTACK;
-			if (auto_muting_main_fade[channel] <= 0.0) {
-				auto_muting_main_fade[channel] = 0.0;
+			if (auto_muting_main_fade[channel] <= 0.0f) {
+				auto_muting_main_fade[channel] = 0.0f;
 				auto_muting_main_state[channel] = MUTED;
-			} else if (auto_muting_main_fade[channel] >= 1.0) {
-				auto_muting_main_fade[channel] = 1.0;
+			} else if (auto_muting_main_fade[channel] >= 1.0f) {
+				auto_muting_main_fade[channel] = 1.0f;
 				auto_muting_main_state[channel] = UNMUTED;
 			}
 			if (auto_muting_main_state[channel] == MUTED)
@@ -875,11 +888,11 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 				auto_muting_aux_fade[channel] -= AUTO_MUTE_DECAY;
 			else if (auto_muting_aux_state[channel] == FADING_UP)
 				auto_muting_aux_fade[channel] += AUTO_MUTE_ATTACK;
-			if (auto_muting_aux_fade[channel] <= 0.0) {
-				auto_muting_aux_fade[channel] = 0.0;
+			if (auto_muting_aux_fade[channel] <= 0.0f) {
+				auto_muting_aux_fade[channel] = 0.0f;
 				auto_muting_aux_state[channel] = MUTED;
-			} else if (auto_muting_aux_fade[channel] >= 1.0) {
-				auto_muting_aux_fade[channel] = 1.0;
+			} else if (auto_muting_aux_fade[channel] >= 1.0f) {
+				auto_muting_aux_fade[channel] = 1.0f;
 				auto_muting_aux_state[channel] = UNMUTED;
 			}
 			if (auto_muting_aux_state[channel] == MUTED)
@@ -892,6 +905,15 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		// The Dry signal is just the clean signal, without any attenuation from LEVEL
 		dry = mainin;
 
+#ifdef DIAG_BYPASS_DELAY
+		/* Diagnostic isolation: skip ALL per-sample delay DSP (loop read,
+		 * regen, DC blocker, soft-clip, wet/dry mix). Feed the dry signal
+		 * straight into the reverb send + output so the reverb keeps running
+		 * at the correct rate while the delay engine costs ~nothing. */
+		mix    = mainin;
+		wr     = 0;
+		auxout = 0;
+#else
 
 		// Read from the loop and save this value so we can output it to the Delay Out jack
 		if (mode[channel][INF] == INF_OFF) {
@@ -899,7 +921,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			rd = rd_buff[i];
 		} else {
 			// Freeze modes: crossfade between buffers
-			t = (uint16_t)(4095.0 * read_fade_pos[channel]);
+			t = (uint16_t)(4095.0f * read_fade_pos[channel]);
 			asm("usat %[dst], #12, %[src]" : [dst] "=r" (t) : [src] "r" (t));
 			rd = ((float)rd_buff[i] * epp_lut[t]) + ((float)rd_buff_dest[i] * epp_lut[4095-t]);
 		}
@@ -958,6 +980,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 		else if (SAMPLESIZE==2)
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (mix) : [src] "r" (mix));
+#endif /* DIAG_BYPASS_DELAY */
 
 #ifdef REVERB_ENABLE
 		/* --- Reverb: send-style routing ---
@@ -967,9 +990,11 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		 * controls how hard the reverb is driven; the tail you hear scales
 		 * with that drive, but the output mix is never silenced.
 		 *
-		 * Earlier diagnostic: skipping `mix += rev_s` on ch1 did NOT
-		 * eliminate the click — confirmed the click is upstream of the
-		 * reverb add. Now testing T2 DMA→memcpy in velvet_reverb.c. */
+		 * Diagnostic (reverb send = 0): clicks disappear. So the click is
+		 * IN the reverb path — the reverb is fed `mix` here, so any step in
+		 * `mix` (gain change, reverse/freeze transition) becomes a step at
+		 * the reverb input and the convolution rings it into an audible
+		 * click, even though the same step is inaudible in the dry path. */
 		{
 			int16_t rev_s;
 			if (channel == 0) {
@@ -1068,6 +1093,13 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 	//Write a block to memory
 
+#ifdef DIAG_FSK_ENABLE
+	uint32_t _wr_t0 = DWT->CYCCNT;
+#endif
+#ifdef DIAG_BYPASS_DELAY
+	/* Diagnostic isolation: skip the SDRAM write-back entirely. */
+	(void)wr_buff;
+#else
 	if (mode[channel][INF] == INF_OFF || mode[channel][INF]==INF_TRANSITIONING_OFF)
 	{
 
@@ -1096,6 +1128,11 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			write_addr[channel] = fade_dest_write_addr[channel];
 		}
 	}
+#endif /* DIAG_BYPASS_DELAY */
+
+#ifdef DIAG_FSK_ENABLE
+	diag_log(DIAG_EVT_ISR_SDRAM_WRITE, DWT->CYCCNT - _wr_t0);
+#endif
 
 
 #ifdef ALLOW_CONT_REVERSE
@@ -1123,6 +1160,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 	{
 		uint32_t _isr_dt = DWT->CYCCNT - _isr_t0;
+		diag_isr_cycles += _isr_dt;   /* so main-loop stage timers can subtract ISR preemption */
 		diag_log(channel == 0 ? DIAG_EVT_AUDIOISR_CH0 : DIAG_EVT_AUDIOISR_CH1, _isr_dt);
 	}
 }

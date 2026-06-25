@@ -25,18 +25,18 @@ typedef enum {
     DIAG_EVT_AUDIOISR_CH1    =  1u, /* process_audio_block_codec channel 1     */
     DIAG_EVT_REVERB_BLOCK    =  2u, /* main-loop reverb block processing       */
     DIAG_EVT_REVERB_DROP     =  3u, /* main loop missed deadline (cycles = 0)  */
-    DIAG_EVT_REVERB_T0       =  4u, /* do_t0_phase + do_t0_recirc (early)      */
-    DIAG_EVT_REVERB_T2       =  5u, /* do_t2_phase + do_t2_recirc (late, stereo) */
-    DIAG_EVT_REVERB_T1       =  6u, /* do_t1_phase + do_t1_recirc (middle)     */
+    DIAG_EVT_REVERB_T0       =  4u, /* do_t0_phase (early refl. + per-tap LFO)  */
+    DIAG_EVT_REVERB_T2       =  5u, /* do_t2_phase (late, stereo)              */
+    DIAG_EVT_REVERB_T1       =  6u, /* do_t1_phase (middle)                    */
     DIAG_EVT_REVERB_MORPH    =  7u, /* update_morph_state cycles               */
     DIAG_EVT_REVERB_FINALIZE =  8u, /* do_finalize (HPF/LPF + upsample + mix)  */
     DIAG_EVT_REVERB_BG_EFF   =  9u, /* background_eff_gains_update (post-block, one stage per call) */
-    DIAG_EVT_REVERB_T0_RECIRC = 10u,/* do_t0_recirc only (subset of T0)        */
-    DIAG_EVT_REVERB_T1_RECIRC = 11u,/* do_t1_recirc only (subset of T1)        */
-    DIAG_EVT_REVERB_T2_RECIRC = 12u,/* do_t2_recirc only (subset of T2)        */
-    DIAG_EVT_RESERVED_13     = 13u,
-    DIAG_EVT_RESERVED_14     = 14u,
-    DIAG_EVT_RESERVED_15     = 15u,
+    DIAG_EVT_REVERB_PREDELAY = 10u, /* do_predelay (2-line feedback sustain engine) */
+    DIAG_EVT_REVERB_ISR_IN_BLOCK = 11u, /* codec-ISR cycles that preempted one reverb block */
+    DIAG_EVT_ISR_SDRAM_READ  = 12u, /* time in memory_read[_varispeed] (SDRAM delay-line reads) */
+    DIAG_EVT_ISR_SDRAM_WRITE = 13u, /* time in memory_write[_fade] (SDRAM delay-line writes) */
+    DIAG_EVT_OUTPUT_MISS     = 14u, /* cumulative count: output read repeated a stale block (bitcrush) */
+    DIAG_EVT_POLL_LATENCY    = 15u, /* cycles from block_ready set -> poll pickup (main-loop lag) */
     DIAG_EVT_COUNT           = 16u,
 } diag_evt_t;
 
@@ -56,6 +56,13 @@ extern volatile uint32_t diag_log_dropped;
 extern volatile uint32_t diag_thresh_cycles[DIAG_EVT_COUNT];
 extern volatile uint32_t diag_evt_total[DIAG_EVT_COUNT];
 extern volatile uint8_t  diag_log_enabled;
+
+/* Running total of cycles spent inside the audio ISRs (process_audio_block_codec).
+ * Each ISR adds its own measured duration here. The main-loop reverb stage
+ * timers sample this before/after a stage and subtract the delta, so per-stage
+ * cycle counts report *pure compute* rather than wall-clock-including-ISR
+ * (the reverb runs in the main loop and is preempted by the codec ISRs). */
+extern volatile uint32_t diag_isr_cycles;
 
 /* Producer.  Safe from any ISR priority. */
 static inline void diag_log(diag_evt_t evt, uint32_t cycles)

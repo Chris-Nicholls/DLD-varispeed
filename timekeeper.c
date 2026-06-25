@@ -150,10 +150,23 @@ void EXTI_Handler(void)
 {
 	if(EXTI_GetITStatus(EXTI_CLOCK_line) != RESET)
 	{
+		/* This EXTI fires on every I2S LRCLK edge (~per audio sample) and
+		 * sits at preemption priority 0 — ABOVE the codec audio ISR — so it
+		 * can keep ping_tmr at sample resolution even while the codec ISR
+		 * runs. inc_tmrs() must stay per-sample for clock measurement, but
+		 * update_channel_leds() (loop-LED / CLKOUT edge timing) only needs a
+		 * few kHz. Running it 48 kHz here preempted the codec ISR ~32×/block
+		 * (which in turn preempts the main-loop reverb), so decimate it.
+		 * LED_DIV = 16 → ~3 kHz refresh; worst-case CLKOUT edge jitter is
+		 * LED_DIV samples (~0.33 ms), negligible vs any audible delay time. */
 		inc_tmrs();
 
-		if (!global_mode[SYSTEM_SETTINGS] && !global_mode[CALIBRATE])
-			update_channel_leds();
+		static uint16_t led_div = 0;
+		if (++led_div >= 16u) {
+			led_div = 0;
+			if (!global_mode[SYSTEM_SETTINGS] && !global_mode[CALIBRATE])
+				update_channel_leds();
+		}
 
 		EXTI_ClearITPendingBit(EXTI_CLOCK_line);
 	}

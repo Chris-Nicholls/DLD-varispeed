@@ -95,6 +95,11 @@ CFLAGS += -DMAX_T2_TAPS=32
 # becomes an FSK-modulated audio stream of cycle-count events. Record
 # the send jack at 48 kHz and decode with test/diag_decode.py.
 #CFLAGS += -DDIAG_FSK_ENABLE
+# Diagnostic isolation: strip the delay engine down to a near-empty ISR
+# (no SDRAM read/write, no per-sample delay DSP) while the codec + reverb
+# push/out keep running. If the reverb STILL corrupts with this on, the
+# cause is poll/main-loop, not delay-ISR preemption. Uncomment to test:
+#CFLAGS += -DDIAG_BYPASS_DELAY
 AFLAGS  = -mlittle-endian -mthumb -mcpu=cortex-m4 
 
 LDSCRIPT = $(DEVICE)/$(LOADFILE)
@@ -123,12 +128,12 @@ $(ELF): $(OBJECTS) $(wildcard *.h)
 	$(CC) $(LFLAGS) -o $@ $(OBJECTS) $(LIBS)
 
 
-$(BUILDDIR)/%.o: %.c
+$(BUILDDIR)/%.o: %.c Makefile
 	mkdir -p $(dir $@)
 	$(CC) -c $(CFLAGS) $< -o $@
 
 
-$(BUILDDIR)/%.o: %.s
+$(BUILDDIR)/%.o: %.s Makefile
 	mkdir -p $(dir $@)
 	$(AS) $(AFLAGS) $< -o $@ > $(addprefix $(BUILDDIR)/, $(addsuffix .lst, $(basename $<)))
 

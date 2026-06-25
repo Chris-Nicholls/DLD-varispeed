@@ -614,11 +614,11 @@ void update_params(void)
 	{
 		int32_t t;
 
-		/* Right LEVEL → Density macro */
+		/* Right LEVEL → Tone macro (Density retired — density is fixed at MAX) */
 		t = (int32_t)i_smoothed_potadc[LEVEL_POT*2+1] + (int32_t)i_smoothed_cvadc[LEVEL*2+1];
 		if (t < 0) t = 0;
 		if (t > 4095) t = 4095;
-		velvet_reverb_apply_density_macro((float)t * (1.0f / 4095.0f));
+		velvet_reverb_apply_tone_macro((float)t * (1.0f / 4095.0f));
 
 		/* Right REGEN → Decay macro */
 		t = (int32_t)i_smoothed_potadc[REGEN_POT*2+1] + (int32_t)i_smoothed_cvadc[REGEN*2+1];
