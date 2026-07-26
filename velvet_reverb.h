@@ -12,7 +12,7 @@
  * Per-stage features:
  *   - Tap count fixed at MAX (density is not a control)
  *   - Window / duration (relocation ladder migrates taps as it shrinks)
- *   - Decay envelope (exp↔linear blend) for T1 and T2
+ *   - Exponential decay envelope on T2 only (T0 taper baked in, T1 flat)
  *   - A pre-delay sustain engine (two modulated, damped feedback delay lines)
  *     sits in front of the cascade and supplies the long tail; the cascade
  *     itself runs purely feedforward. T0 also gets a per-tap Lexicon LFO.
@@ -167,10 +167,6 @@ extern float reverb_t0_window_ms_target;     /* 0..~200 */
 extern float reverb_t1_window_ms_target;     /* 0..~666 */
 extern float reverb_t2_duration_s_target;    /* 0..~8 */
 
-/* Per-stage decay shape (0 = exponential, 1 = linear). T0 has no envelope. */
-extern float reverb_t1_decay_shape;
-extern float reverb_t2_decay_shape;
-
 /* ---- Pre-delay sustain engine (replaces recirculation) ----
  * Two feedback delay lines A/B with one shared loop gain, shared low/high
  * shelves (tone + damping), per-line modulation, ~12 Hz DC block, input
@@ -204,16 +200,9 @@ void velvet_reverb_poll(void);
 
 /* ---- Macro system ----
  *
- * Three macros — Density, Decay, Tone — each take a 0..1 position. Each
- * macro has a fixed list of per-param mappings (with lo/hi sub-range, both
- * in [0,1]). When multiple macros map the same param, their effective-t's
- * (per-mapping lerp(lo, hi, u)) are multiplied together; the product lerps
- * the param's bounds.
- *
- * Bounds + mappings mirror the JS prototype's velvet_param_bounds /
- * velvet_macros snapshot; baked-in here. Density has been retired (density is
- * fixed at MAX), so the right LEVEL pot now drives Tone and Decay is driven by
- * the right REGEN pot (see params.c). */
+ * Two macros — Decay and Tone — each take a 0..1 pot position. Every mapped
+ * param uses the full range: u lerps bound_min..bound_max (exp where both > 0).
+ * Decay is driven by the right REGEN pot; Tone by the right LEVEL pot. */
 void velvet_reverb_apply_decay_macro  (float v);
 void velvet_reverb_apply_tone_macro   (float v);
 void velvet_reverb_recompute_macros   (void);

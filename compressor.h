@@ -54,9 +54,11 @@ void init_compressor(uint32_t max_sample_val, float threshold_percent);
  * the previous compressor.c implementation. */
 static inline int32_t compress(int32_t val)
 {
-	float tv = THRESHOLD_COMPILED / ((float)val);
-	if (val > THRESHOLD_VALUE) return (MAX_SAMPLEVAL - tv);
-	else if (val < -THRESHOLD_VALUE) return (-MAX_SAMPLEVAL - tv);
+	/* In-range samples (the overwhelmingly common case) pass through with no
+	 * float work.  The expensive VDIV + int<->float conversions are only paid
+	 * on the rare samples that actually exceed the soft-clip threshold. */
+	if (val > THRESHOLD_VALUE)       return (int32_t)(MAX_SAMPLEVAL  - THRESHOLD_COMPILED / (float)val);
+	else if (val < -THRESHOLD_VALUE) return (int32_t)(-MAX_SAMPLEVAL - THRESHOLD_COMPILED / (float)val);
 	else return val;
 }
 

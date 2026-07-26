@@ -25,11 +25,11 @@
  *   - Density is FIXED at MAX: every stage generates MAX taps once at init
  *     (sign + 1/√N; T0 keeps the cosine tail-taper). There is no runtime
  *     density control and no per-tap removal rank.
- *   - Window sizes and decay shapes are mutable globals smoothed per-block
- *     with a one-pole IIR (driven by the Decay macro). Each tap has a
- *     relocation ladder so it migrates one-at-a-time as the window shrinks.
+ *   - Window sizes are mutable globals smoothed per-block with a one-pole IIR
+ *     (driven by the Decay macro). Each tap has a relocation ladder so it
+ *     migrates one-at-a-time as the window shrinks.
  *   - Each block we recompute the *effective* per-tap gain (int16 Q15):
- *         base × window-fade × envelope × gain-comp
+ *         base × window-fade × [T2 exp envelope] × gain-comp
  *     and the convolution inner loops read from these effGains arrays, so
  *     window/envelope/loudness all change smoothly without regenerating taps.
  *   - The effGains recompute is round-robin across the three stages (one
@@ -198,27 +198,14 @@ static float host_effwin_t2[MAX_T2_TAPS];  /* relocation/window gain only (no de
 float reverb_send      = 0.7f;   /* updated each params iter from right MIX pot */
 float reverb_dry_gain  = 1.0f;   /* fades to 0 over top 10% of right MIX pot */
 /* Defaults below match the user's velvet_buffers slider snapshot. Macro-driven
- * params (windows, decays, feedback, mix, lpf/hpf, high-shelf Hz) are recomputed
- * from the Decay/Tone pots at init; their values here are the resolved operating
- * point (Decay≈0.86, Tone≈0.77) to avoid a startup transient. */
+ * params (windows, feedback, mix, lpf/hpf, high-shelf Hz) are recomputed from
+ * the Decay/Tone pots at init. */
 float reverb_lpf_hz    = 8600.0f;   /* Tone → MP_LPF */
 float reverb_hpf_hz    = 170.0f;    /* Tone → MP_HPF */
 
 float reverb_t0_window_ms_target  = 69.0f;     /* Decay → JS paramT1Window */
 float reverb_t1_window_ms_target  = 536.0f;    /* Decay → JS paramTmWindow */
 float reverb_t2_duration_s_target = 3.217f;    /* Decay → JS paramT2Duration */
-
-float reverb_t1_decay_shape = 0.91f;   /* Decay → JS paramTmDecay (inert: T1 flat) */
-float reverb_t2_decay_shape = 0.0f;    /* Fixed: full exponential. JS toggleT2Linear
-                                        * has bounds {-1,0} → the slider clamps the
-                                        * result to its real min (0), so it never
-                                        * activates; not macro-driven. */
-
-/* Per-stage flat-decay flags (JS flatDecayTm / flatDecayT2). When set the
- * stage's decay envelope is forced to 1.0 (no slope); gain-comp still
- * normalises loudness against the flat baseGain energy. */
-static uint8_t reverb_t1_flat_decay = 1;   /* JS flatDecayTm = true  */
-static uint8_t reverb_t2_flat_decay = 0;   /* JS flatDecayT2 = false */
 
 /* ==== Pre-delay sustain engine params ==== Macro-driven: feedback, delay_mix,
  * high-shelf Hz. Fixed (no macro maps them): delay times, low-shelf, high-shelf
@@ -278,19 +265,18 @@ float reverb_t0_tap_mod_rate   = 0.59f;
  * threshold; the knee only shapes genuine overs. */
 #define SOFT_KNEE_T  0.80f
 
-/* ==== Macro system ==== Mirrors the JS prototype's velvet_param_bounds +
- * velvet_macros snapshot. Three macros (Density, Decay, Tone), each with a
- * 0..1 slider value, fixed mappings to a subset of params. Multiplicative
- * combination across macros — see velvet_reverb_recompute_macros below. */
+/* ==== Macro system ====
+ * Two macros (Decay, Tone), each 0..1. Every mapped param uses the full macro
+ * range — macro value u lerps bound_min..bound_max (exp where both > 0). */
 typedef enum {
     MP_T0_WINDOW,
-    MP_T1_WINDOW, MP_T1_DECAY,
-    MP_T2_DURATION, MP_T2_DECAY,
-    MP_FEEDBACK, MP_PREDELAY_A, MP_PREDELAY_B, MP_DELAY_MIX,
-    MP_FB_LOW_SHELF_DB, MP_FB_HIGH_SHELF_DB, MP_FB_HIGH_SHELF_HZ,
-    MP_DUCK_AMOUNT, MP_DUCK_RELEASE,
-    MP_FB_MOD_DEPTH, MP_FB_MOD_RATE,
-    MP_LPF, MP_HPF,
+    MP_T1_WINDOW,
+    MP_T2_DURATION,
+    MP_FEEDBACK,
+    MP_DELAY_MIX,
+    MP_LPF,
+    MP_HPF,
+    MP_FB_HIGH_SHELF_HZ,
     MP_COUNT
 } macro_param_id_t;
 
@@ -302,79 +288,39 @@ typedef struct {
 } macro_param_t;
 
 typedef struct {
-    macro_param_id_t param_id;
-    float lo, hi;
-} macro_mapping_t;
-
-typedef struct {
     float value;
-    float curve_power;      /* u' = u^curve_power applied before mapping; 1.0 = linear */
-    int   num_mappings;
-    const macro_mapping_t *mappings;
+    int   num_params;
+    const macro_param_id_t *params;
 } macro_t;
 
-/* Bounds + use_exp: exp lerp where min>0, max>0, min!=max AND use_exp set.
- * Density and recirculation params have been retired (density fixed at MAX,
- * recirc replaced by the pre-delay sustain engine). Stage remap JS→firmware:
- * paramTm→T1, paramT2→T2; C T0 (early reflections) ≈ JS T1. */
-/* Bounds + use_exp mirror the JS prototype's velvet_param_bounds and the
- * exp-curve rule shouldUseExpMacroCurve (decay/tone params always use_exp; the
- * recompute guard below falls back to linear when a bound is <= 0). Stage remap
- * JS→firmware: JS paramT1→C T0 (early), JS paramTm→C T1, JS paramT2→C T2.
- * Params not referenced by any mapping (predelay times, shelf dB/freq-low, duck,
- * fb-mod) keep their fixed global defaults — they are never written here. */
+/* Bounds + use_exp mirror velvet_param_bounds. Stage remap JS→firmware:
+ * JS paramT1→C T0, JS paramTm→C T1, JS paramT2→C T2. Unmapped globals
+ * (predelay times, shelf dB/freq-low, duck, fb-mod) keep fixed defaults. */
 static macro_param_t reverb_macro_params[MP_COUNT] = {
-    [MP_T0_WINDOW]        = { &reverb_t0_window_ms_target,   28.0f,    80.0f,  1 }, /* JS paramT1Window */
-    [MP_T1_WINDOW]        = { &reverb_t1_window_ms_target,  150.0f,   660.0f,  1 }, /* JS paramTmWindow */
-    [MP_T1_DECAY]         = { &reverb_t1_decay_shape,         0.5f,     1.0f,  1 }, /* JS paramTmDecay (inert: T1 flat) */
-    [MP_T2_DURATION]      = { &reverb_t2_duration_s_target,   0.8f,     4.0f,  1 }, /* JS paramT2Duration */
-    [MP_T2_DECAY]         = { &reverb_t2_decay_shape,         0.0f,     2.0f,  0 }, /* fixed 0 (exp); not mapped */
-    [MP_FEEDBACK]         = { &reverb_feedback,               0.8f,     1.0f,  1 }, /* JS paramFeedback */
-    [MP_PREDELAY_A]       = { &reverb_predelay_a_s,           0.02f,    0.5f,  1 },
-    [MP_PREDELAY_B]       = { &reverb_predelay_b_s,           0.03f,    0.5f,  1 },
-    [MP_DELAY_MIX]        = { &reverb_delay_mix,             -1.3f,     1.0f,  1 }, /* JS paramReverbDelayMix (→ linear) */
-    [MP_FB_LOW_SHELF_DB]  = { &reverb_fb_low_shelf_db,      -12.0f,    12.0f,  0 },
-    [MP_FB_HIGH_SHELF_DB] = { &reverb_fb_high_shelf_db,     -18.0f,     0.0f,  0 },
-    [MP_FB_HIGH_SHELF_HZ] = { &reverb_fb_high_shelf_hz,    1000.0f,  2500.0f,  1 }, /* JS paramFbHighShelfFreq */
-    [MP_DUCK_AMOUNT]      = { &reverb_duck_amount,            0.0f,     1.0f,  0 },
-    [MP_DUCK_RELEASE]     = { &reverb_duck_release_s,         0.05f,    0.5f,  1 },
-    [MP_FB_MOD_DEPTH]     = { &reverb_fb_mod_depth,           0.0f,     1.0f,  0 },
-    [MP_FB_MOD_RATE]      = { &reverb_fb_mod_rate,            0.1f,     2.0f,  1 },
-    [MP_LPF]              = { &reverb_lpf_hz,               500.0f, 20000.0f,  1 }, /* JS paramLpf */
-    [MP_HPF]              = { &reverb_hpf_hz,               100.0f,   200.0f,  1 }, /* JS paramHpf */
+    [MP_T0_WINDOW]        = { &reverb_t0_window_ms_target,   28.0f,    80.0f,  1 },
+    [MP_T1_WINDOW]        = { &reverb_t1_window_ms_target,  150.0f,   660.0f,  1 },
+    [MP_T2_DURATION]      = { &reverb_t2_duration_s_target,   0.8f,     4.0f,  1 },
+    [MP_FEEDBACK]         = { &reverb_feedback,               0.8f,     1.0f,  1 },
+    [MP_DELAY_MIX]        = { &reverb_delay_mix,             -1.3f,     1.0f,  0 }, /* linear: neg bound */
+    [MP_LPF]              = { &reverb_lpf_hz,               500.0f, 20000.0f,  1 },
+    [MP_HPF]              = { &reverb_hpf_hz,               100.0f,   200.0f,  1 },
+    [MP_FB_HIGH_SHELF_HZ] = { &reverb_fb_high_shelf_hz,    1000.0f,  2500.0f,  1 },
 };
 
-/* ---- Decay macro mapping (right REGEN pot) ----
- * From the JS prototype's velvet_macros "decay" macro. Drives the windows,
- * decays, feedback and the pre-delay mix. Each entry is { param, lo, hi }: the
- * macro position u (0..1) lerps the param's effective-t between lo and hi, then
- * the param bounds above are applied (exp where both bounds > 0, else linear). */
-static const macro_mapping_t decay_mappings[] = {
-    { MP_T2_DURATION,  0.0f, 1.0f },   /* paramT2Duration */
-    { MP_T0_WINDOW,    0.0f, 1.0f },   /* paramT1Window  (JS T1 → C T0) */
-    { MP_T1_WINDOW,    0.0f, 1.0f },   /* paramTmWindow  (JS Tm → C T1) */
-    { MP_T1_DECAY,     0.0f, 1.0f },   /* paramTmDecay   (inert: T1 flat) */
-    /* toggleT2Linear omitted: bounds {-1,0} clamp to 0 → constant exponential. */
-    { MP_FEEDBACK,     0.0f, 1.0f },   /* paramFeedback */
-    { MP_DELAY_MIX,    0.0f, 1.0f },   /* paramReverbDelayMix */
+static const macro_param_id_t decay_params[] = {
+    MP_T2_DURATION, MP_T0_WINDOW, MP_T1_WINDOW, MP_FEEDBACK, MP_DELAY_MIX,
 };
-/* ---- Tone macro mapping (right LEVEL pot) ---- JS velvet_macros "tone". */
-static const macro_mapping_t tone_mappings[] = {
-    { MP_LPF,              0.0f, 1.0f },   /* paramLpf */
-    { MP_HPF,              0.0f, 1.0f },   /* paramHpf */
-    { MP_FB_HIGH_SHELF_HZ, 0.0f, 1.0f },   /* paramFbHighShelfFreq */
+static const macro_param_id_t tone_params[] = {
+    MP_LPF, MP_HPF, MP_FB_HIGH_SHELF_HZ,
 };
 
 #define M_COUNT(arr) (int)(sizeof(arr) / sizeof((arr)[0]))
-/* Two macros now: index 0 = Decay (right REGEN pot), index 1 = Tone (right
- * LEVEL pot — Density retired). No pre-curve. Decay is overwritten each iter
- * from REGEN; Tone from LEVEL (see params.c). */
 #define MACRO_DECAY  0
 #define MACRO_TONE   1
 #define NUM_MACROS   2
 static macro_t reverb_macros[NUM_MACROS] = {
-    { 0.86f, 1.0f, M_COUNT(decay_mappings), decay_mappings },   /* Decay default (REGEN) */
-    { 0.77f, 1.0f, M_COUNT(tone_mappings),  tone_mappings  },   /* Tone default (LEVEL) */
+    { 0.86f, M_COUNT(decay_params), decay_params },
+    { 0.77f, M_COUNT(tone_params),  tone_params  },
 };
 
 /* Macro recompute is ~14 powf calls (~17 µs). Called from params.c at
@@ -386,41 +332,22 @@ static volatile uint8_t macros_dirty = 1;   /* force initial recompute */
 
 void velvet_reverb_recompute_macros(void)
 {
-    /* tByParam < 0 sentinel = no macro maps this param. */
-    float tByParam[MP_COUNT];
-    for (int p = 0; p < MP_COUNT; p++) tByParam[p] = -1.0f;
     for (int m = 0; m < NUM_MACROS; m++) {
         float u = reverb_macros[m].value;
         if (u < 0.0f) u = 0.0f; if (u > 1.0f) u = 1.0f;
-        /* Pre-curve on macro position. powf(u, 3) is special-cased to a
-         * triple multiply to avoid the ~200-cycle generic powf for the
-         * common cubic case. */
-        float cp = reverb_macros[m].curve_power;
-        if (cp == 3.0f) {
-            u = u * u * u;
-        } else if (cp != 1.0f) {
-            u = powf(u, cp);
-        }
-        const macro_mapping_t *maps = reverb_macros[m].mappings;
-        int n = reverb_macros[m].num_mappings;
+        const macro_param_id_t *pids = reverb_macros[m].params;
+        int n = reverb_macros[m].num_params;
         for (int i = 0; i < n; i++) {
-            float tMap = maps[i].lo + u * (maps[i].hi - maps[i].lo);
-            int pid = maps[i].param_id;
-            if (tByParam[pid] < 0.0f) tByParam[pid] = 1.0f;
-            tByParam[pid] *= tMap;
+            const macro_param_t *mp = &reverb_macro_params[pids[i]];
+            float val;
+            if (mp->use_exp && mp->bound_min > 0.0f && mp->bound_max > 0.0f &&
+                mp->bound_min != mp->bound_max) {
+                val = mp->bound_min * powf(mp->bound_max / mp->bound_min, u);
+            } else {
+                val = mp->bound_min + u * (mp->bound_max - mp->bound_min);
+            }
+            *mp->target = val;
         }
-    }
-    for (int p = 0; p < MP_COUNT; p++) {
-        if (tByParam[p] < 0.0f) continue;
-        const macro_param_t *mp = &reverb_macro_params[p];
-        float t = tByParam[p];
-        float val;
-        if (mp->use_exp && mp->bound_min > 0.0f && mp->bound_max > 0.0f && mp->bound_min != mp->bound_max) {
-            val = mp->bound_min * powf(mp->bound_max / mp->bound_min, t);
-        } else {
-            val = mp->bound_min + t * (mp->bound_max - mp->bound_min);
-        }
-        *mp->target = val;
     }
 }
 
@@ -453,16 +380,12 @@ void velvet_reverb_apply_tone_macro   (float v) { set_macro_value(MACRO_TONE, v)
  * Block rate = fs_reverb / REVERB_BLOCK = 24000 / 16 = 1500 Hz.
  *   tau ≈ 1/(α × 1500). 0.0219 → ~30 ms (window), 0.00664 → ~100 ms (decay). */
 #define ALPHA_WINDOW_MORPH   0.0219f
-#define ALPHA_DECAY_MORPH    0.00664f
 /* ==== Morph state ====
- * Density is fixed at MAX, so there is no tap-count morph. The windows and
- * decay shapes still morph (driven by the Decay macro); the gain-comp morph
- * tracks the resulting energy. */
+ * Density is fixed at MAX, so there is no tap-count morph. Windows morph
+ * (driven by the Decay macro); gain-comp morph tracks the resulting energy. */
 static float t0_window_morph;       /* samples at fs_reverb */
 static float t1_window_morph;
 static float t2_window_morph;
-static float t1_decay_morph;
-static float t2_decay_morph;
 static float t0_tap_comp_morph;
 static float t1_tap_comp_morph;
 static float t2_tap_comp_morph;
@@ -636,56 +559,21 @@ static inline float smoothstep01(float x)
     if (x >= 1.0f) return 1.0f;
     return x * x * (3.0f - 2.0f * x);
 }
-/* Per-tap decay envelope (frac ∈ [0,1] = effOff / window). exp falls to
- * ~1e-4 (-80 dB) across the window — steeper than a natural-room curve but
- * sounds right with the ladder keeping density constant; without the faster
- * falloff, late taps stay audible enough to muddy the tail.
- * Uses the precomputed exp_env_lut (filled in velvet_reverb_init). */
+/* Per-tap T2 exponential decay envelope (frac ∈ [0,1] = effOff / window).
+ * exp falls to ~1e-4 (-80 dB) across the window. T0 has taper baked in;
+ * T1 has no decay envelope. Uses exp_env_lut (filled in velvet_reverb_init). */
 #define ENV_FRAC_BINS  32
 static float exp_env_lut[ENV_FRAC_BINS] CCM_ATTR;
 
-/* Largest plateau exponent (at shape = 2): 1 - frac^P. Higher = flatter hold
- * and a faster fade right at the end. */
-#define DECAY_PLATEAU_P  10.0f
-
-/* Plateau LUT for the shape ∈ (1,2] region. 2D: shape rows × frac columns,
- * plateau_lut[s][f] = 1 - (f/(N-1))^P(s), P(s) sweeping 1 (linear) ->
- * DECAY_PLATEAU_P across the rows. Filled with powf once at init so the per-tap
- * runtime cost is a bilinear lerp (no powf in recompute_eff_gains, which runs in
- * the main-loop block path — a per-tap powf there overran the block budget). */
-#define PLATEAU_SHAPE_BINS  16
-static float plateau_lut[PLATEAU_SHAPE_BINS * ENV_FRAC_BINS] CCM_ATTR;
-
-/* shape: 0 = exponential, 1 = linear, 2 = "logarithmic" plateau (stays loud
- * across the window, quick fade only at the very end). 0..1 blends exp->linear
- * via exp_env_lut; 1..2 bilinearly interpolates plateau_lut. Continuous at
- * shape = 1 (linEnv == plateau row 0, P = 1). */
-static inline float decay_envelope_from_frac(float frac, float shape)
+static inline float exp_decay_from_frac(float frac)
 {
     if (frac < 0.0f) frac = 0.0f;
     if (frac > 1.0f) frac = 1.0f;
-    if (shape <= 1.0f) {
-        float bin_f = frac * (float)(ENV_FRAC_BINS - 1);
-        int i = (int)bin_f;
-        if (i > ENV_FRAC_BINS - 2) i = ENV_FRAC_BINS - 2;
-        float t = bin_f - (float)i;
-        float expEnv = exp_env_lut[i] + t * (exp_env_lut[i + 1] - exp_env_lut[i]);
-        float linEnv = 1.0f - frac;
-        return expEnv + shape * (linEnv - expEnv);
-    }
-    /* Bilinear interp into plateau_lut (shape-1 over the rows, frac over cols). */
-    float sN = shape - 1.0f; if (sN > 1.0f) sN = 1.0f;
-    float s_f = sN * (float)(PLATEAU_SHAPE_BINS - 1);
-    int si = (int)s_f; if (si > PLATEAU_SHAPE_BINS - 2) si = PLATEAU_SHAPE_BINS - 2;
-    float st = s_f - (float)si;
-    float f_f = frac * (float)(ENV_FRAC_BINS - 1);
-    int fi = (int)f_f; if (fi > ENV_FRAC_BINS - 2) fi = ENV_FRAC_BINS - 2;
-    float ft = f_f - (float)fi;
-    const float *r0 = &plateau_lut[si * ENV_FRAC_BINS];
-    const float *r1 = &plateau_lut[(si + 1) * ENV_FRAC_BINS];
-    float a = r0[fi] + ft * (r0[fi + 1] - r0[fi]);
-    float b = r1[fi] + ft * (r1[fi + 1] - r1[fi]);
-    return a + st * (b - a);
+    float bin_f = frac * (float)(ENV_FRAC_BINS - 1);
+    int i = (int)bin_f;
+    if (i > ENV_FRAC_BINS - 2) i = ENV_FRAC_BINS - 2;
+    float t = bin_f - (float)i;
+    return exp_env_lut[i] + t * (exp_env_lut[i + 1] - exp_env_lut[i]);
 }
 
 /* ==== Biquad cookbook coefficients ==== */
@@ -1126,8 +1014,6 @@ void velvet_reverb_init(void)
     t0_window_morph = reverb_t0_window_ms_target * (float)REVERB_FS_HZ / 1000.0f;
     t1_window_morph = reverb_t1_window_ms_target * (float)REVERB_FS_HZ / 1000.0f;
     t2_window_morph = reverb_t2_duration_s_target * (float)REVERB_FS_HZ;
-    t1_decay_morph  = reverb_t1_decay_shape;
-    t2_decay_morph  = reverb_t2_decay_shape;
     t0_tap_comp_morph = 1.0f;
     t1_tap_comp_morph = 1.0f;
     t2_tap_comp_morph = 1.0f;
@@ -1139,16 +1025,6 @@ void velvet_reverb_init(void)
     for (int i = 0; i < ENV_FRAC_BINS; i++) {
         float frac = (float)i / (float)(ENV_FRAC_BINS - 1);
         exp_env_lut[i] = expf(-9.21034f * frac);
-    }
-
-    /* Pre-compute the plateau LUT (shape 1..2 region) so the runtime envelope is
-     * a bilinear lerp instead of a per-tap powf. powf only runs here, at init. */
-    for (int s = 0; s < PLATEAU_SHAPE_BINS; s++) {
-        float P = 1.0f + ((float)s / (float)(PLATEAU_SHAPE_BINS - 1)) * (DECAY_PLATEAU_P - 1.0f);
-        for (int f = 0; f < ENV_FRAC_BINS; f++) {
-            float frac = (float)f / (float)(ENV_FRAC_BINS - 1);
-            plateau_lut[s * ENV_FRAC_BINS + f] = 1.0f - powf(frac, P);
-        }
     }
 
     velvet_reverb_regenerate_taps();
@@ -1369,19 +1245,16 @@ static void recompute_eff_gains_t1(void)
     float window = t1_window_morph;
     float fade = window * FADE_WINDOW_FRAC;
     if (fade < T1_FADE_MIN) fade = T1_FADE_MIN;
-    float invWindow = (window > 1e-6f) ? 1.0f / window : 0.0f;
 
     float effWin[MAX_T1_TAPS];
     compute_tap_states_mono(t1TapLadder, t1TapLadderCount, count, window, fade,
                             effOffT1, effWin);
 
+    /* T1 has no decay envelope — density fixed at MAX. */
     float pre[MAX_T1_TAPS];
     float energy = 0.0f;
     for (int t = 0; t < count; t++) {
-        float frac = (float)effOffT1[t] * invWindow;
-        float env  = reverb_t1_flat_decay ? 1.0f
-                       : decay_envelope_from_frac(frac, t1_decay_morph);
-        float g = (float)t1TapGains[t] * effWin[t] * env;
+        float g = (float)t1TapGains[t] * effWin[t];
         pre[t] = g;
         energy += g * g;
     }
@@ -1416,9 +1289,7 @@ static void recompute_eff_gains_t2(void)
     float energy = 0.0f;
     for (int t = 0; t < count; t++) {
         float frac = (float)effOffT2L[t] * invWindow;
-        float env  = reverb_t2_flat_decay ? 1.0f
-                       : decay_envelope_from_frac(frac, t2_decay_morph);
-        float g = (float)t2TapGains[t] * effWin[t] * env;
+        float g = (float)t2TapGains[t] * effWin[t] * exp_decay_from_frac(frac);
         pre[t] = g;
         energy += g * g;
     }
@@ -1469,8 +1340,6 @@ static void update_morph_state(void)
     t0_window_morph += ALPHA_WINDOW_MORPH * (t0_win_target - t0_window_morph);
     t1_window_morph += ALPHA_WINDOW_MORPH * (t1_win_target - t1_window_morph);
     t2_window_morph += ALPHA_WINDOW_MORPH * (t2_win_target - t2_window_morph);
-    t1_decay_morph  += ALPHA_DECAY_MORPH  * (reverb_t1_decay_shape - t1_decay_morph);
-    t2_decay_morph  += ALPHA_DECAY_MORPH  * (reverb_t2_decay_shape - t2_decay_morph);
 
     /* Smooth the pre-delay loop lengths so a Decay-macro sweep doesn't
      * pitch-glide / zipper the feedback lines. Feedback/mix/shelf are gain-
@@ -1511,18 +1380,15 @@ static void update_morph_state(void)
  * so genuine user gestures register but pot jitter doesn't. */
 #define DB_WINDOW_TARGET   0.50f      /* ms */
 #define DB_DURATION_TARGET 0.01f      /* seconds */
-#define DB_DECAY_TARGET    0.005f
 
 static float last_t0_win_target = -1e9f, last_t1_win_target = -1e9f, last_t2_dur_target = -1e9f;
-static float last_t1_dec_target = -1e9f, last_t2_dec_target = -1e9f;
 static uint16_t effgains_settle_counter = 0;
 static uint16_t effgains_periodic_counter = 0;
 
 static void background_eff_gains_update(void)
 {
-    /* Watch user-facing targets for movement. Each target has a dead-band
-     * tuned to ignore ADC/smoothing jitter while catching deliberate moves.
-     * Density is fixed at MAX so only the windows/decays are watched. */
+    /* Watch user-facing targets for movement. Density is fixed at MAX so only
+     * the windows are watched. */
     int changed = 0;
     if (fabsf(reverb_t0_window_ms_target - last_t0_win_target) > DB_WINDOW_TARGET) {
         last_t0_win_target = reverb_t0_window_ms_target; changed = 1;
@@ -1532,12 +1398,6 @@ static void background_eff_gains_update(void)
     }
     if (fabsf(reverb_t2_duration_s_target - last_t2_dur_target) > DB_DURATION_TARGET) {
         last_t2_dur_target = reverb_t2_duration_s_target; changed = 1;
-    }
-    if (fabsf(reverb_t1_decay_shape - last_t1_dec_target) > DB_DECAY_TARGET) {
-        last_t1_dec_target = reverb_t1_decay_shape; changed = 1;
-    }
-    if (fabsf(reverb_t2_decay_shape - last_t2_dec_target) > DB_DECAY_TARGET) {
-        last_t2_dec_target = reverb_t2_decay_shape; changed = 1;
     }
 
     if (changed) effgains_settle_counter = EFFGAINS_SETTLE_BLOCKS;
@@ -1559,9 +1419,7 @@ static void background_eff_gains_update(void)
             int converged =
                 fabsf(t0w - t0_window_morph) < 1.0f &&
                 fabsf(t1w - t1_window_morph) < 1.0f &&
-                fabsf(t2w - t2_window_morph) < 1.0f &&
-                fabsf(reverb_t1_decay_shape - t1_decay_morph) < 1e-3f &&
-                fabsf(reverb_t2_decay_shape - t2_decay_morph) < 1e-3f;
+                fabsf(t2w - t2_window_morph) < 1.0f;
             if (!converged) effgains_settle_counter = 1;
         }
     }
@@ -1713,11 +1571,16 @@ static void do_input_write_t0(void)
 {
     /* Attenuate the (pre-delayed) input into the cascade by REVERB_HEADROOM so
      * the whole int16 chain runs cooler; the output stage makes it back up.
-     * predelay_out is normalised ±1 (may exceed during sustain) — clamp to
-     * int16 here. */
+     * predelay_out is normalised ±1 but blooms well past it during sustain
+     * (the pre-delay node clamp is ±4, so predelay_out can reach ~±5). Use the
+     * SAME soft knee as every other stage bridge (soft_clip_int16) rather than
+     * a hard clamp: the JS reference feeds a float ring here and never clips, so
+     * a hard int16 clamp injects an edge that the cascade diffuses into an
+     * audible "whoosh". The soft knee rounds those occasional overs off
+     * smoothly, matching the JS behaviour as closely as int16 allows. */
     for (int i = 0; i < REVERB_BLOCK; i++) {
         uint32_t wi = ring_write_idx + (uint32_t)i;
-        t0_ring[wi & T0_RING_MASK] = clamp_f_to_int16(predelay_out[i] * (32768.0f * REVERB_HEADROOM));
+        t0_ring[wi & T0_RING_MASK] = soft_clip_int16(predelay_out[i] * (32768.0f * REVERB_HEADROOM));
     }
     block_write_idx = ring_write_idx;
     ring_write_idx += REVERB_BLOCK;

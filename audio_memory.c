@@ -66,33 +66,41 @@ uint32_t memory_read(uint32_t *addr, uint8_t channel, int32_t *rd_buff, uint8_t 
 	uint8_t i;
 	uint32_t heads_crossed=0;
 
-	//Loop of 8 takes 2.5us
-	//read from SDRAM. first one takes 200us, subsequent reads take 50ns
+	/* Same hot-loop transform as the varispeed 1x fast path: drop the
+	 * per-sample FMC_FLAG_Busy busy-poll (the FMC inserts bus wait-states
+	 * automatically — polling it was pure overhead) and inline the address
+	 * advance, only falling back to inc/dec_addr at a true loop boundary so
+	 * the wrap is bit-identical to the original. */
+	const uint32_t loop_base = LOOP_RAM_BASE[channel];
+	const uint32_t loop_end  = loop_base + loop_size[channel];
+	const int reversed       = (mode[channel][REV] != 0) ^ (decrement != 0);
+	const int32_t  step      = reversed ? -(int32_t)SAMPLESIZE : (int32_t)SAMPLESIZE;
+	const int      is16      = (SAMPLESIZE == 2);
+
+	uint32_t a = addr[channel];
+	if ((a < SDRAM_BASE) || (a > (SDRAM_BASE + SDRAM_SIZE)))
+		a = SDRAM_BASE;
+	a &= 0xFFFFFFFEu;
+
 	for (i=0;i<num_samples;i++){
-
-		//Enforce valid addr range
-		if ((addr[channel]<SDRAM_BASE) || (addr[channel] > (SDRAM_BASE + SDRAM_SIZE)))
-		addr[channel]=SDRAM_BASE;
-
-		//even addresses only
-		addr[channel] = (addr[channel] & 0xFFFFFFFE);
-
-		while(FMC_GetFlagStatus(FMC_Bank2_SDRAM, FMC_FLAG_Busy) != RESET){;}
-
-		if (SAMPLESIZE==2)
-			rd_buff[i] = *((int16_t *)(addr[channel]));
+		if (is16)
+			rd_buff[i] = *((int16_t *)a);
 		else
-			rd_buff[i] = *((int32_t *)(addr[channel]));
+			rd_buff[i] = *((int32_t *)a);
 
-		if (decrement)
-			addr[channel] = dec_addr(addr[channel], channel);
-		else
-			addr[channel] = inc_addr(addr[channel], channel);
+		uint32_t na = (uint32_t)((int32_t)a + step);
+		int at_boundary = (step > 0) ? (na >= loop_end) : (na <= loop_base);
+		if (__builtin_expect(at_boundary, 0)) {
+			if (decrement) na = dec_addr(a, channel);
+			else           na = inc_addr(a, channel);
+			na &= 0xFFFFFFFEu;
+		}
+		a = na;
 
-		if (addr[channel]==loop_addr) heads_crossed=1;
-
+		if (a==loop_addr) heads_crossed=1;
 	}
 
+	addr[channel] = a;
 	return(heads_crossed);
 }
 
@@ -105,33 +113,52 @@ uint32_t memory_read_varispeed(uint32_t *addr, float *frac_pos, uint8_t channel,
 	 * interpolation. Keep this optimization inside the memory helper so the
 	 * caller's varispeed state machine stays intact. */
 	if (speed > 0.999f && speed < 1.001f && *frac_pos > -0.001f && *frac_pos < 0.001f) {
+		/* Fast path: exact 1x. The old form paid an out-of-line inc/dec_addr
+		 * call for the read pointer plus a vestigial FMC busy-poll on every
+		 * sample (~1 µs/sample). Here the read-pointer advance is inlined with
+		 * a boundary fallback (same scheme the varispeed slow path uses) and
+		 * the FMC poll is dropped — the controller inserts wait-states on the
+		 * bus automatically, so polling FMC_FLAG_Busy per sample was pure
+		 * overhead. target_read_addr still advances via inc/dec_addr exactly
+		 * as before (one call/sample, matching the slow path). */
+		const uint32_t loop_base = LOOP_RAM_BASE[channel];
+		const uint32_t loop_end  = loop_base + loop_size[channel];
+		const int reversed       = (mode[channel][REV] != 0) ^ (decrement != 0);
+		const int32_t  step      = reversed ? -(int32_t)SAMPLESIZE : (int32_t)SAMPLESIZE;
+		const int      is16      = (SAMPLESIZE == 2);
+
+		uint32_t a = addr[channel];
+		if ((a < SDRAM_BASE) || (a > (SDRAM_BASE + SDRAM_SIZE)))
+			a = SDRAM_BASE;
+		a &= 0xFFFFFFFEu;
+
 		for (i = 0; i < num_samples; i++) {
 			if (decrement)
 				target_read_addr[channel] = dec_addr(target_read_addr[channel], channel);
 			else
 				target_read_addr[channel] = inc_addr(target_read_addr[channel], channel);
 
-			if ((addr[channel] < SDRAM_BASE) || (addr[channel] > (SDRAM_BASE + SDRAM_SIZE)))
-				addr[channel] = SDRAM_BASE;
-
-			addr[channel] = (addr[channel] & 0xFFFFFFFE);
-
-			while(FMC_GetFlagStatus(FMC_Bank2_SDRAM, FMC_FLAG_Busy) != RESET){;}
-
-			if (SAMPLESIZE == 2)
-				rd_buff[i] = *((int16_t *)(addr[channel]));
+			if (is16)
+				rd_buff[i] = *((int16_t *)a);
 			else
-				rd_buff[i] = *((int32_t *)(addr[channel]));
+				rd_buff[i] = *((int32_t *)a);
 
-			if (decrement)
-				addr[channel] = dec_addr(addr[channel], channel);
-			else
-				addr[channel] = inc_addr(addr[channel], channel);
+			/* Advance read pointer; only fall back to inc/dec_addr at a true
+			 * loop boundary (matches the slow path's proven wrap semantics). */
+			uint32_t na = (uint32_t)((int32_t)a + step);
+			int at_boundary = (step > 0) ? (na >= loop_end) : (na <= loop_base);
+			if (__builtin_expect(at_boundary, 0)) {
+				if (decrement) na = dec_addr(a, channel);
+				else           na = inc_addr(a, channel);
+				na &= 0xFFFFFFFEu;
+			}
+			a = na;
 
-			if (addr[channel] == loop_addr)
+			if (a == loop_addr)
 				heads_crossed = 1;
 		}
 
+		addr[channel] = a;
 		*frac_pos = 0.0f;
 		return heads_crossed;
 	}
@@ -255,30 +282,40 @@ void memory_write(uint32_t *addr, uint8_t channel, int32_t *wr_buff, uint8_t num
 {
 	uint8_t i;
 
+	/* Hot path: runs every sample in normal delay operation. Drop the
+	 * per-sample FMC_FLAG_Busy busy-poll (~1 µs/sample of pure overhead —
+	 * the FMC stalls the AHB bus on its own) and inline the address advance
+	 * with a boundary fallback to inc/dec_addr, exactly as the read fast
+	 * path does. write_addr therefore advances bit-identically to before and
+	 * stays in lockstep with read_addr. */
+	const uint32_t loop_base = LOOP_RAM_BASE[channel];
+	const uint32_t loop_end  = loop_base + loop_size[channel];
+	const int reversed       = (mode[channel][REV] != 0) ^ (decrement != 0);
+	const int32_t  step      = reversed ? -(int32_t)SAMPLESIZE : (int32_t)SAMPLESIZE;
+	const int      is16      = (SAMPLESIZE == 2);
+
+	uint32_t a = addr[channel];
+	if ((a < SDRAM_BASE) || (a > (SDRAM_BASE + SDRAM_SIZE)))
+		a = SDRAM_BASE;
+	a &= 0xFFFFFFFEu;
+
 	for (i=0;i<num_samples;i++){
-
-		//Enforce valid addr range
-		if ((addr[channel]<SDRAM_BASE) || (addr[channel] > (SDRAM_BASE + SDRAM_SIZE)))
-			addr[channel]=SDRAM_BASE;
-
-		//even addresses only
-		addr[channel] = (addr[channel] & 0xFFFFFFFE);
-
-		while(FMC_GetFlagStatus(FMC_Bank2_SDRAM, FMC_FLAG_Busy) != RESET){;}
-
-		if (SAMPLESIZE==2)
-			*((int16_t *)addr[channel]) = wr_buff[i];
+		if (is16)
+			*((int16_t *)a) = (int16_t)wr_buff[i];
 		else
-			*((int32_t *)addr[channel]) = wr_buff[i];
+			*((int32_t *)a) = wr_buff[i];
 
-		if (decrement)
-			addr[channel] = dec_addr(addr[channel], channel);
-		else
-			addr[channel] = inc_addr(addr[channel], channel);
-
-
+		uint32_t na = (uint32_t)((int32_t)a + step);
+		int at_boundary = (step > 0) ? (na >= loop_end) : (na <= loop_base);
+		if (__builtin_expect(at_boundary, 0)) {
+			if (decrement) na = dec_addr(a, channel);
+			else           na = inc_addr(a, channel);
+			na &= 0xFFFFFFFEu;
+		}
+		a = na;
 	}
 
+	addr[channel] = a;
 }
 
 //
@@ -292,37 +329,45 @@ void memory_fade_write(uint32_t *addr, uint8_t channel, int32_t *wr_buff, uint8_
 	int32_t rd;
 	int32_t mix;
 
+	/* Crossfade write path (used during write fades). Same transform: drop
+	 * the two per-sample FMC busy-polls, inline the address advance, and use
+	 * single-precision float literals for the fade mix (the `1.0-fade` double
+	 * literal forced software double-precision emulation per sample). */
+	const uint32_t loop_base = LOOP_RAM_BASE[channel];
+	const uint32_t loop_end  = loop_base + loop_size[channel];
+	const int reversed       = (mode[channel][REV] != 0) ^ (decrement != 0);
+	const int32_t  step      = reversed ? -(int32_t)SAMPLESIZE : (int32_t)SAMPLESIZE;
+	const int      is16      = (SAMPLESIZE == 2);
+	const float    fade_w    = fade;
+	const float    fade_r    = 1.0f - fade;
+
+	uint32_t a = addr[channel];
+	if ((a < SDRAM_BASE) || (a > (SDRAM_BASE + SDRAM_SIZE)))
+		a = SDRAM_BASE;
+	a &= 0xFFFFFFFEu;
+
 	for (i=0;i<num_samples;i++){
-
-		while(FMC_GetFlagStatus(FMC_Bank2_SDRAM, FMC_FLAG_Busy) != RESET){;}
-
-		//Enforce valid addr range
-		if ((addr[channel]<SDRAM_BASE) || (addr[channel] > (SDRAM_BASE + SDRAM_SIZE)))
-			addr[channel]=SDRAM_BASE;
-
-		//even addresses only
-		addr[channel] = (addr[channel] & 0xFFFFFFFE);
-
-		//read from address
-		if (SAMPLESIZE==2)
-			rd = *((int16_t *)(addr[channel]));
+		if (is16)
+			rd = *((int16_t *)a);
 		else
-			rd = *((int32_t *)(addr[channel]));
+			rd = *((int32_t *)a);
 
-		mix = ((float)wr_buff[i] * fade) + ((float)rd * (1.0-fade));
+		mix = (int32_t)(((float)wr_buff[i] * fade_w) + ((float)rd * fade_r));
 
-		while(FMC_GetFlagStatus(FMC_Bank2_SDRAM, FMC_FLAG_Busy) != RESET){;}
-
-		if (SAMPLESIZE==2)
-			*((int16_t *)addr[channel]) = mix;
+		if (is16)
+			*((int16_t *)a) = (int16_t)mix;
 		else
-			*((int32_t *)addr[channel]) = mix;
+			*((int32_t *)a) = mix;
 
-		if (decrement)
-			addr[channel] = dec_addr(addr[channel], channel);
-		else
-			addr[channel] = inc_addr(addr[channel], channel);
-
+		uint32_t na = (uint32_t)((int32_t)a + step);
+		int at_boundary = (step > 0) ? (na >= loop_end) : (na <= loop_base);
+		if (__builtin_expect(at_boundary, 0)) {
+			if (decrement) na = dec_addr(a, channel);
+			else           na = inc_addr(a, channel);
+			na &= 0xFFFFFFFEu;
+		}
+		a = na;
 	}
 
+	addr[channel] = a;
 }
