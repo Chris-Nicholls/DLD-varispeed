@@ -71,7 +71,7 @@ extern int16_t host_t2_ring_storage[T2_RING_SAMPLES];
  * read/write wraps are a cheap mask; it covers PRE_DELAY_MAX + 2×PRE_MOD. */
 #define PRE_DELAY_LINE_SAMPLES  16384UL
 #define PRE_DELAY_LINE_MASK     (PRE_DELAY_LINE_SAMPLES - 1)
-#define PRE_DELAY_MAX_SAMPLES   12000   /* 0.5 s @ 24 kHz (firmware cap; JS = 1 s) */
+#define PRE_DELAY_MAX_SAMPLES   12000   /* 0.5 s @ 24 kHz */
 #define PRE_MOD_MAX_SAMPLES     720     /* 0.030 s @ 24 kHz (depth = 1 swing) */
 
 #ifdef VELVET_REVERB_HOST
@@ -178,7 +178,7 @@ extern float reverb_t2_duration_s_target;    /* 0..~8 */
 /* ---- Pre-delay sustain engine (replaces recirculation) ----
  * Two feedback delay lines A/B with one shared loop gain, shared low/high
  * shelves (tone + damping), per-line modulation, ~12 Hz DC block, input
- * ducking, and a dry/wet crossfade into the cascade. JS-matched defaults. */
+ * ducking, and a dry/wet crossfade into the cascade. */
 extern float reverb_feedback;            /* shared loop gain (clamped 0.999) */
 extern float reverb_predelay_a_s;        /* line A delay time, seconds */
 extern float reverb_predelay_b_s;        /* line B delay time, seconds */

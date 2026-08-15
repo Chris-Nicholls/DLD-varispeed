@@ -229,25 +229,24 @@ float reverb_dry_gain  = 1.0f;   /* fades to 0 over top 10% of right MIX pot */
 float reverb_lpf_hz    = 8600.0f;   /* Tone → MP_LPF */
 float reverb_hpf_hz    = 170.0f;    /* Tone → MP_HPF */
 
-float reverb_t0_window_ms_target  = 69.0f;     /* Decay → JS paramT1Window */
-float reverb_t1_window_ms_target  = 536.0f;    /* Decay → JS paramTmWindow */
-float reverb_t2_duration_s_target = 3.217f;    /* Decay → JS paramT2Duration */
+float reverb_t0_window_ms_target  = 69.0f;     /* driven by Decay */
+float reverb_t1_window_ms_target  = 536.0f;    /* driven by Decay */
+float reverb_t2_duration_s_target = 3.217f;    /* driven by Decay */
 
 /* ==== Pre-delay sustain engine params ==== Macro-driven: feedback, delay_mix,
  * high-shelf Hz. Fixed (no macro maps them): delay times, low-shelf, high-shelf
  * dB, fb-mod, duck. All values from the user's slider snapshot. */
-float reverb_feedback         = 0.969f;  /* Decay → JS paramFeedback */
-float reverb_predelay_a_s      = 0.185f;  /* fixed: JS reverbDelayTimeA */
-float reverb_predelay_b_s      = 0.300f;  /* fixed: JS reverbDelayTimeB */
-float reverb_delay_mix         = 0.68f;   /* Decay → JS reverbDelayMix */
-float reverb_fb_low_shelf_hz   = 200.0f;  /* fixed: JS feedbackLowShelfFreq */
-float reverb_fb_low_shelf_db   = -2.5f;   /* fixed: JS feedbackLowShelfDb */
-float reverb_fb_high_shelf_hz  = 2000.0f; /* Tone → JS feedbackHighShelfFreq */
-float reverb_fb_high_shelf_db  = -0.5f;   /* fixed: JS feedbackHighShelfDb */
-float reverb_fb_mod_depth      = 0.01f;   /* fixed: JS feedbackModDepth */
-float reverb_fb_mod_rate       = 0.35f;   /* fixed: JS feedbackModRate */
-float reverb_duck_amount       = 1.0f;    /* fixed: JS delayDuckAmount */
-float reverb_duck_release_s    = 2.0f;    /* fixed: JS delayDuckRelease */
+float reverb_feedback         = 0.969f;  /* driven by Decay */
+float reverb_predelay_a_s      = 0.185f;  /* fixed */
+float reverb_predelay_b_s      = 0.300f;  /* fixed */
+float reverb_delay_mix         = 0.68f;   /* driven by Decay */
+float reverb_fb_low_shelf_hz   = 200.0f;  /* fixed */
+float reverb_fb_low_shelf_db   = -2.5f;   /* fixed */
+float reverb_fb_high_shelf_hz  = 2000.0f; /* driven by Tone */
+float reverb_fb_high_shelf_db  = -0.5f;   /* fixed; only HF damping in the loop */
+float reverb_fb_mod_depth      = 0.01f;   /* fixed */
+float reverb_fb_mod_rate       = 0.35f;   /* fixed */
+float reverb_duck_amount       = 1.0f;    /* fixed */
 /* Duck release, expressed in LOOP TRAVERSALS rather than seconds.
  *
  * The duck attenuates whatever passes the pre-delay write node, and buffer
@@ -265,36 +264,35 @@ float reverb_duck_release_s    = 2.0f;    /* fixed: JS delayDuckRelease */
 float reverb_duck_release_loops = 1.0f;   /* fixed */
 
 /* T0 per-tap Lexicon LFO (early-reflection smearer; replaces recirc mod).
- * Fixed defaults from JS paramT1TapMod* (JS T1 → C T0). */
+ * Fixed defaults. */
 float reverb_t0_tap_mod_depth  = 0.26f;
 float reverb_t0_tap_mod_rate   = 0.59f;
 
 #define TAP_COMP_CLAMP        2.0f       /* max gain-comp boost (avoid int16 overflow) */
 
-/* ~12 Hz DC-block one-pole in each pre-delay feedback loop (JS PRE_HP_COEFF). */
+/* ~12 Hz DC-block one-pole in each pre-delay feedback loop. */
 #define PRE_HP_FREQ_HZ        12.0f
-/* Fixed ~2 ms duck attack (JS DUCK_ATK_COEF). */
+/* Fixed ~2 ms duck attack. */
 #define DUCK_ATK_SEC          0.002f
-/* Minimum pre-delay read time (JS preMinT = 5 ms) so reads stay in the past. */
+/* Minimum pre-delay read time (5 ms) so reads stay in the past. */
 #define PRE_MIN_TIME_SAMPLES  (0.005f * (float)REVERB_FS_HZ)
-/* depth = 1 → ~5 ms T0 per-tap swing (JS T1_TAP_MOD_MAX). */
+/* depth = 1 → ~5 ms T0 per-tap swing. */
 #define T0_TAP_MOD_MAX_SAMPLES  (0.005f * (float)REVERB_FS_HZ)
 #define GOLDEN_ANGLE_RAD      2.39996322972865332f
 
 /* Mid-side stereo width applied to the final T2 output in do_finalize.
  * 1.0 = neutral, <1 narrows toward mono, >1 widens by boosting the
  * decorrelated (L-R) component. Only T2 is stereo (T0/T1 are mono), so this
- * directly scales that decorrelation. Hard-coded for now (JS paramStereoWidth). */
+ * directly scales that decorrelation. Hard-coded for now. */
 #ifndef REVERB_STEREO_WIDTH            /* overridable so the harness can sweep it */
 #define REVERB_STEREO_WIDTH   1.47f
 #endif
 
 /* Internal headroom. The whole int16 cascade runs at REVERB_HEADROOM × level
  * (cooler), and the output is scaled back up by REVERB_OUT_MAKEUP = 1/headroom.
- * This mirrors the JS float path's headroom: inter-stage values that would push
- * past int16 full-scale (conv-sum peaks, recirc feedback, etc.) now sit below
- * it, so the soft knee (below) rarely engages — matching the JS until a true
- * over. Cost: the internal computation runs ~6 dB closer to the int16 LSB at
+ * Inter-stage values that would otherwise push past int16 full-scale (conv-sum
+ * peaks, recirc feedback, etc.) now sit below it, so the soft knee (below)
+ * rarely engages and the path stays transparent until a true over. Cost: the internal computation runs ~6 dB closer to the int16 LSB at
  * 0.5, so the quietest tail loses ~1 bit of SNR. Raise toward 1.0 if the decay
  * sounds grainy; lower toward 0.5 if clipping persists. The pre-T2 saturator is
  * gain-compensated (see apply_pre_t2_sat) so its drive/character is unchanged. */
@@ -402,9 +400,8 @@ typedef struct {
     const macro_param_id_t *params;
 } macro_t;
 
-/* Bounds + use_exp mirror velvet_param_bounds. Stage remap JS→firmware:
- * JS paramT1→C T0, JS paramTm→C T1, JS paramT2→C T2. Unmapped globals
- * (predelay times, shelf dB/freq-low, duck, fb-mod) keep fixed defaults. */
+/* Unmapped globals (predelay times, shelf dB/freq-low, duck, fb-mod) keep their
+ * fixed defaults. */
 static macro_param_t reverb_macro_params[MP_COUNT] = {
     [MP_T0_WINDOW]        = { &reverb_t0_window_ms_target,   28.0f,    80.0f,  1 },
     [MP_T1_WINDOW]        = { &reverb_t1_window_ms_target,  150.0f,   660.0f,  1 },
@@ -475,9 +472,9 @@ static inline void set_macro_value(int idx, float v) {
  * the top: the last few % of travel cover fb 0.994→0.999, which is roughly a
  * 6x tail-length change and a ~9 dB drop in the sustain plateau. Hardware pots
  * rarely reach full ADC scale, so the pre-delay tail would never reach the
- * full (JS-matching) length the app gets at macro=100. Saturate the top of the
- * Decay macro so the last DECAY_MACRO_TOP_SAT of travel maps to full — this
- * leaves the true-full behaviour identical to JS, it only makes it reachable. */
+ * full length the design allows at macro = 100. Saturate the top of the Decay
+ * macro so the last DECAY_MACRO_TOP_SAT of travel maps to full — this leaves the
+ * true-full behaviour unchanged, it only makes it reachable. */
 #define DECAY_MACRO_TOP_SAT  0.96f
 void velvet_reverb_apply_decay_macro  (float v) {
     v *= (1.0f / DECAY_MACRO_TOP_SAT);          /* set_macro_value clamps to [0,1] */
@@ -532,8 +529,8 @@ static float fb_hs_hz_morph = 2000.0f;
 /* ==== Pre-delay sustain engine state ====
  * Two float feedback delay lines in SDRAM (see velvet_reverb.h). Shared loop
  * gain + shelves (tone/damping), per-line modulation + DC block, input duck,
- * and a dry/wet crossfade into the cascade. Mirrors JS velvet_kernel lines
- * 599-663. The line storage is float so the high-feedback loop doesn't
+ * and a dry/wet crossfade into the cascade. The line storage is float so the
+ * high-feedback loop doesn't
  * accumulate int16 quantisation noise. */
 static float * const predelay_a = (float *)PRE_DELAY_A_BASE;
 static float * const predelay_b = (float *)PRE_DELAY_B_BASE;
@@ -826,8 +823,7 @@ static void biquad_hpf(Biquad *bq, float freq, float fs)
     bq->a2 = (1.0f - alpha) / a0;
 }
 /* RBJ shelving filters (S = 1 slope). Used inside the pre-delay feedback loop
- * at the reverb rate. dB > 0 boosts, < 0 cuts. Mirrors JS biquadLowShelf /
- * biquadHighShelf. */
+ * at the reverb rate. dB > 0 boosts, < 0 cuts. */
 static void biquad_lowshelf(Biquad *bq, float freq, float dB, float fs)
 {
     float A = powf(10.0f, dB / 40.0f);
@@ -1014,7 +1010,7 @@ static void generate_mono_stage(uint32_t *outOffsets, int16_t *outGains,
 }
 
 /* ---- Gap-fill ladder builder (MAIN taps) ----
- * Mirrors the JS app's buildGapFill. As the window shrinks, the tap at the
+ * As the window shrinks, the tap at the
  * largest offset "falls off the end" and is reinserted into the largest interior
  * gap among the remaining taps — keeping them roughly equally spaced (velvet) and
  * the density up, instead of the geometric ×0.25 descent that scrambled the
@@ -1177,12 +1173,11 @@ void velvet_reverb_regenerate_taps(void)
 }
 
 /* Per-stage fade-zone minimum samples — keeps the relocation bell smooth even
- * at very short window settings. Matches the JS prototype's per-stage floors
- * (JS T1→C T0 = 192, JS Tm→C T1 = 192, JS T2→C T2 = 512). */
+ * at very short window settings. T2's floor is larger because its window is. */
 #define T0_FADE_MIN  192.0f
 #define T1_FADE_MIN  192.0f
 #define T2_FADE_MIN  512.0f
-/* Relocation crossfade width as a fraction of the window (JS = 0.06). */
+/* Relocation crossfade width as a fraction of the window. */
 #define FADE_WINDOW_FRAC  0.06f
 
 /* ==== Init ==== */
@@ -1190,8 +1185,8 @@ void velvet_reverb_init(void)
 {
     /* Apply default macro positions so the reverb_* targets reflect the
      * macro-derived values rather than the raw initialisers at the top of
-     * this file. Density and Decay start at 0; Tone at 0.83 (from the JS
-     * snapshot the bounds were captured from). */
+     * this file. Density and Decay start at 0; Tone at 0.83, the position the
+     * macro bounds were captured at. */
     velvet_reverb_recompute_macros();
 
     {
@@ -1329,7 +1324,7 @@ void velvet_reverb_init(void)
 /* ==== Saturate helpers ==== */
 
 /* Soft knee in full-scale units (1.0 == full scale). Transparent (unity, like
- * the JS float path) for |x| <= SOFT_KNEE_T; above it a rational knee that is
+ * a float path) for |x| <= SOFT_KNEE_T; above it a rational knee that is
  * C1-continuous at the threshold (value and slope match the linear region) and
  * asymptotes to ±1.0. Replaces the old hard clip so overs round off musically
  * instead of clipping harshly. */
@@ -1921,9 +1916,9 @@ __attribute__((always_inline)) static inline float fast_sin_pi(float x)
 /* ==== Pre-delay sustain engine ====
  * Two modulated, damped feedback delay lines in front of the cascade. Reads
  * input_ready (int16), works in normalised ±1 float (so duck / node-clamp /
- * shelf math matches the JS prototype exactly), and writes the cascade input
- * into predelay_out (still normalised; clamped to int16 in do_input_write_t0).
- * Mirrors velvet_kernel.js lines 599-663. When feedback is 0 the loop is
+ * shelf math all operate on a float signal), and writes the cascade input into
+ * predelay_out (still normalised; clamped to int16 in do_input_write_t0).
+ * When feedback is 0 the loop is
  * bypassed and the dry input passes straight through. */
 static void do_predelay(void)
 {
@@ -2053,10 +2048,9 @@ static void do_input_write_t0(void)
      * predelay_out is normalised ±1 but blooms well past it during sustain
      * (the pre-delay node clamp is ±4, so predelay_out can reach ~±5). Use the
      * SAME soft knee as every other stage bridge (soft_clip_int16) rather than
-     * a hard clamp: the JS reference feeds a float ring here and never clips, so
-     * a hard int16 clamp injects an edge that the cascade diffuses into an
-     * audible "whoosh". The soft knee rounds those occasional overs off
-     * smoothly, matching the JS behaviour as closely as int16 allows. */
+     * a hard clamp: a hard int16 clamp injects an edge that the cascade diffuses
+     * into an audible "whoosh", whereas the soft knee rounds those occasional
+     * overs off smoothly. */
     for (int i = 0; i < REVERB_BLOCK; i++) {
         uint32_t wi = ring_write_idx + (uint32_t)i;
         float v = predelay_out[i] * (32768.0f * REVERB_HEADROOM);
@@ -2158,8 +2152,8 @@ static uint32_t t0_mod_gab [MAX_T0_TAPS] CCM_ATTR;
 
 /* Modulated T0 convolution — each tap's read position is displaced by a
  * per-tap (golden-angle phase) LFO so the early-reflection cluster shimmers
- * (Lexicon-style chorused early reflections). Mirrors JS accumOffMod: extra ∈
- * [0, 2·depth] keeps reads in the past.
+ * (Lexicon-style chorused early reflections). extra ∈ [0, 2·depth] keeps reads
+ * in the past.
  *
  * The modulation offset is held constant across the 16-sample block: a slow
  * chorus LFO moves < 1 sample over 0.67 ms, so a zero-order hold at block rate
@@ -2396,8 +2390,7 @@ static void do_t2_phase(void)
 
 /* Pre-T2 tanh saturation. Applied to the freshly-written block of t2_ring
  * (Tm bridge output) so all future T2 tap reads see the saturated signal.
- * Mirrors the JS prototype's "Pre T2"
- * insertion point. Pregain drives the tanh; postgain trims the result.
+ * Pregain drives the tanh; postgain trims the result.
  * Values are hardcoded to the user's chosen 2.0 / 0.5; expose as globals
  * later if they need to tweak. */
 #ifndef SAT_PRE_T2_PREGAIN
@@ -2824,8 +2817,8 @@ int16_t velvet_reverb_out_right(void)
 #ifdef VELVET_REVERB_HOST
 /* ==== Host-only test hooks: tap relocation / uniformity probe ====
  * Set a stage's morphed window directly and recompute its effGains/effOff so
- * the host harness can inspect the tap relocation ladder (analogue of
- * test/velvet_relocate.js). Settles the gain-comp morph by recomputing a few
+ * the host harness can inspect the tap relocation ladder. Settles the gain-comp
+ * morph by recomputing a few
  * times so effGain magnitudes are stable. Density is fixed at MAX. */
 int  host_t2_tap_count(void)         { return t2TapCount; }
 uint16_t host_t2_effoff_l(int i)     { return effOffT2L[i]; }
