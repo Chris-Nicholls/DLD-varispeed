@@ -1,3 +1,20 @@
 build/*
+build_*/
 *.pyc
+__pycache__/
 main.map
+.DS_Store
+.cursor/
+
+# Capture and analysis artifacts (regenerate with the host harness / a recording)
+*.wav
+c_ir.csv
+
+# Host test harness: sources and the Makefile are tracked, build products are not
+# (the binaries have no extension, so allow-list rather than pattern-match).
+test/host_test/*
+!test/host_test/*.c
+!test/host_test/*.h
+!test/host_test/*.py
+!test/host_test/*.js
+!test/host_test/Makefile
