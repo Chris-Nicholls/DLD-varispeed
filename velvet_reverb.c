@@ -877,16 +877,13 @@ static inline void dma2_fetch_tap(uint32_t tapOffset, int16_t *dst)
     }
 }
 #else
-/* DIAGNOSTIC: replace DMA2 prefetch with CPU memcpy. If channel-1 clicks
- * vanish with this, T2's DMA bus contention on SDRAM with channel 1's
- * audio reads is the source (they share the upper SDRAM half). Costs CPU
- * cycles (~16 word reads × 32 taps × 2 passes per block ≈ 1k cycles), so
- * expect slightly higher reverb_T2 timing but well under the deadline.
- *
- * Overridable from the Makefile (`make PROFILE=1 NODMA=1`) so the DMA and
- * CPU-copy paths can be A/B'd by comparing reverb_T2 between two builds. */
+/* CPU-copy alternative to the DMA2 prefetch, selected by `make NODMA=1`. T2's
+ * DMA shares the upper SDRAM half with channel 1's audio reads, so this is the
+ * A/B for bus contention there: compare reverb_T2 between two builds. Costs
+ * ~16 word reads x 32 taps x 2 passes per block, about 1k cycles, which raises
+ * reverb_T2 but stays well inside the deadline. */
 #ifndef DMA2_DISABLED_FOR_DIAGNOSTIC
-#define DMA2_DISABLED_FOR_DIAGNOSTIC  0   /* revert: not the cause */
+#define DMA2_DISABLED_FOR_DIAGNOSTIC  0
 #endif
 
 /* Profile-build accumulators, summed across all 64 tap fetches of one block
@@ -2278,41 +2275,6 @@ static void do_t1_phase(void)
     }
 }
 
-#if 0 /* superseded by the chunked loop above; kept for reference */
-static void do_t1_phase_unchunked(void)
-{
-    int tapEnd = t1TapCount;
-    for (int t = 0; t < tapEnd; t++) {
-        uint32_t gain = (uint32_t)(int32_t)effGains_t1[t];
-        uint32_t base = (block_write_idx - (uint32_t)effOffT1[t]) & T1_RING_MASK;
-
-        uint32_t until_wrap = T1_RING_SAMPLES - base;
-        uint32_t n1 = (until_wrap < (uint32_t)REVERB_BLOCK) ? until_wrap : (uint32_t)REVERB_BLOCK;
-
-        const int16_t *src = &t1_ring[base];
-        int i = 0;
-        for (uint32_t k = 0; k < n1; k += 2, i += 2) {
-            uint32_t s_pair = *((const u32_alias *)(src + k));
-            int32_t p0 = smulbb(s_pair, gain);
-            int32_t p1 = smultb(s_pair, gain);
-            accT1[i]   = qadd_sat(accT1[i],   p0);
-            accT1[i+1] = qadd_sat(accT1[i+1], p1);
-        }
-        if (n1 < (uint32_t)REVERB_BLOCK) {
-            src = &t1_ring[0];
-            uint32_t n2 = (uint32_t)REVERB_BLOCK - n1;
-            for (uint32_t k = 0; k < n2; k += 2, i += 2) {
-                uint32_t s_pair = *((const u32_alias *)(src + k));
-                int32_t p0 = smulbb(s_pair, gain);
-                int32_t p1 = smultb(s_pair, gain);
-                accT1[i]   = qadd_sat(accT1[i],   p0);
-                accT1[i+1] = qadd_sat(accT1[i+1], p1);
-            }
-        }
-    }
-}
-#endif /* superseded */
-
 static void do_bridge_t1_to_t2(void)
 {
     for (int i = 0; i < REVERB_BLOCK; i += 2) {
@@ -2620,13 +2582,6 @@ void velvet_reverb_poll(void)
      * sequence counters wrap. */
     if (in_wr_seq == in_rd_seq) return;
     input_ready = in_ring[in_rd_seq % REVERB_IN_NBUF];
-
-    /* DIAGNOSTIC RESULT (reverb send = 0): clicks DISAPPEAR. The clicks are
-     * in the reverb path — either the reverb amplifying a step in its input
-     * (it is fed the delay `mix`, so any gain/mode step zippers the input and
-     * the convolution rings it into an audible click that is inaudible in the
-     * dry path) or an output-ring underrun. Supersedes the earlier
-     * poll-short-circuit test, which was confounded. */
 
 #ifndef VELVET_REVERB_HOST
 #ifdef DIAG_REVERB_PROFILE

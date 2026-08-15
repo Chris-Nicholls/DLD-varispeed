@@ -972,9 +972,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		 *   state += ((wr << 8) - state) >> 12         alpha ≈ 1/4096
 		 *   wr    -= state >> 8                        subtract DC estimate
 		 * Cutoff ~1.86 Hz @ 48 kHz, close to the original float 1/4800.
-		 *
-		 * DIAGNOSTIC RESULT (skip on ch1): clicks persist. DC blocker
-		 * innocent. Restored to normal here. */
+		 */
 		if (global_mode[RUNAWAYDC_BLOCK])
 		{
 			/* wr may be negative here (it's a sum of three signed values
@@ -1012,13 +1010,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		 * these jacks have no plug detection and no hardware normalling, so a
 		 * replacing insert would silence the reverb whenever nothing is
 		 * patched. Scaling the sum by the right MIX keeps that pot's meaning
-		 * intact — it still sets reverb drive, for the returned signal too.
-		 *
-		 * Diagnostic (reverb send = 0): clicks disappear. So the click is
-		 * IN the reverb path — the reverb is fed `mix` here, so any step in
-		 * `mix` (gain change, reverse/freeze transition) becomes a step at
-		 * the reverb input and the convolution rings it into an audible
-		 * click, even though the same step is inaudible in the dry path. */
+		 * intact — it still sets reverb drive, for the returned signal too. */
 		{
 			int16_t rev_s;
 			/* This channel's contribution to the mono reverb input. */
@@ -1091,11 +1083,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			*dst++ = 0;
 
 #else
-
-
-			/* DIAGNOSTIC RESULT (mix=mainin on ch1): MAIN clean. Confirms
-			 * the click lives in DSP between mainin and the final mix
-			 * write. Disabled here so we can run the next bisection. */
 
 			if (SAMPLESIZE==2){
 				int32_t main_out = mix + CODEC_DAC_CALIBRATION_DCOFFSET[0+channel];
