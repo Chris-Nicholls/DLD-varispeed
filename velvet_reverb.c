@@ -244,7 +244,9 @@ float reverb_t0_tap_mod_rate   = 0.59f;
  * 1.0 = neutral, <1 narrows toward mono, >1 widens by boosting the
  * decorrelated (L-R) component. Only T2 is stereo (T0/T1 are mono), so this
  * directly scales that decorrelation. Hard-coded for now (JS paramStereoWidth). */
+#ifndef REVERB_STEREO_WIDTH            /* overridable so the harness can sweep it */
 #define REVERB_STEREO_WIDTH   1.47f
+#endif
 
 /* Internal headroom. The whole int16 cascade runs at REVERB_HEADROOM × level
  * (cooler), and the output is scaled back up by REVERB_OUT_MAKEUP = 1/headroom.
@@ -255,15 +257,81 @@ float reverb_t0_tap_mod_rate   = 0.59f;
  * 0.5, so the quietest tail loses ~1 bit of SNR. Raise toward 1.0 if the decay
  * sounds grainy; lower toward 0.5 if clipping persists. The pre-T2 saturator is
  * gain-compensated (see apply_pre_t2_sat) so its drive/character is unchanged. */
+#ifndef REVERB_HEADROOM                /* overridable so the harness can sweep it */
 #define REVERB_HEADROOM    0.5f
+#endif
+
+/* Soft-knee threshold (full-scale units) for the inter-stage / output saturators.
+ * |x| <= threshold passes through linearly (transparent); above it a
+ * C1 rational knee rounds off toward ±1.0 instead of a hard int16 clamp. With the
+ * headroom above, signals normally stay under the threshold; the knee only shapes
+ * genuine overs. Declared here rather than further down because the host
+ * instrumentation needs it to count knee entry. Overridable so the harness can A/B
+ * the knee out of the path. */
+#ifndef SOFT_KNEE_T
+#define SOFT_KNEE_T  0.80f
+#endif
 #define REVERB_OUT_MAKEUP  (1.0f / REVERB_HEADROOM)
 
-/* Soft-knee threshold (full-scale units) for the inter-stage / output
- * saturators. |x| <= threshold passes through linearly (transparent, like the
- * JS); above it a C1 rational knee rounds off toward ±1.0 instead of the old
- * hard int16 clamp. With the headroom above, signals normally stay under the
- * threshold; the knee only shapes genuine overs. */
-#define SOFT_KNEE_T  0.80f
+#ifdef VELVET_REVERB_HOST
+/* Host-only drive instrumentation, read by the host harness. Not compiled into
+ * the firmware. */
+float    host_dbg_t0_in_peak   = 0.0f;
+uint32_t host_dbg_t0_sat_count = 0;
+
+/* Every other clipping point in the cascade, so a test can say WHICH stage is
+ * being driven into its knee rather than only the first one. Peaks are expressed
+ * as a fraction of full scale, so 1.0 is exactly at the limit. This matters
+ * because a soft knee is silent about how hard it is working, and clipping high
+ * frequencies at 24 kHz throws harmonics past Nyquist that fold back as
+ * broadband hash — which sounds like noise rather than like distortion. */
+float    host_dbg_t01_peak = 0.0f;  uint32_t host_dbg_t01_sat = 0;  /* accT0 -> t1_ring */
+float    host_dbg_t12_peak = 0.0f;  uint32_t host_dbg_t12_sat = 0;  /* accT1 -> t2_ring */
+float    host_dbg_out_peak = 0.0f;  uint32_t host_dbg_out_sat = 0;  /* accL/R -> output  */
+
+/* The final int16 conversion, measured as a DISTRIBUTION rather than a peak. A
+ * peak says only that the ceiling was touched once; what decides the fix is how
+ * much of the time it is being touched. A handful of samples per second can be
+ * dealt with by a limiter at no cost in loudness, whereas a few percent means the
+ * wet signal is simply louder than the output can carry. */
+float    host_dbg_final_peak  = 0.0f;
+uint64_t host_dbg_final_n     = 0;   /* samples converted        */
+uint64_t host_dbg_final_knee  = 0;   /* ... above the knee       */
+uint64_t host_dbg_final_over  = 0;   /* ... at or past full scale */
+double   host_dbg_final_sumsq = 0.0;
+
+/* Q30 full scale, matching soft_saturate_q15. */
+#define HOST_Q30_FS 1073741824.0f
+/* Counts entry into the KNEE, not overs. soft_clip_unit is transparent only up to
+ * SOFT_KNEE_T (0.80), so a peak of 0.98 is already being shaped even though it
+ * never reaches full scale — counting against 1.0 reports zero while the stage is
+ * distorting steadily. */
+static inline void host_note_sat(int32_t x, float *peak, uint32_t *cnt)
+{
+    float m = (float)x * (1.0f / HOST_Q30_FS);
+    if (m < 0.0f) m = -m;
+    if (m > *peak) *peak = m;
+    if (m > SOFT_KNEE_T) (*cnt)++;
+}
+
+/* The ±4 hard clamp on the pre-delay feedback node. A hard clamp is a level
+ * dependent nonlinearity that engages only on peaks, which is the shape of the
+ * remaining artifact: sporadic, worse with louder input, and present in a
+ * sustained tail. Counted so a test can say whether it fires at all. */
+float    host_dbg_node_peak    = 0.0f;
+uint32_t host_dbg_node_clamps  = 0;
+
+/* effGains recompute accounting. The count alone says little — what clicks is an
+ * ISOLATED recompute, one that lands after a long gap and so has to snap the tap
+ * gains across all the morph drift accumulated in that gap. A recompute that
+ * follows hard on the heels of another only moves the gains a little. */
+uint32_t host_dbg_bg_blocks    = 0;   /* blocks background_eff_gains_update saw  */
+uint32_t host_dbg_eff_calls    = 0;   /* recomputes performed                    */
+uint32_t host_dbg_eff_isolated = 0;   /* recomputes >10 blocks after the last    */
+uint32_t host_dbg_eff_maxgap   = 0;   /* largest gap before a recompute (blocks) */
+uint32_t host_dbg_eff_lastblk  = 0;   /* exported so a test can reset the run     */
+#endif
+
 
 /* ==== Macro system ====
  * Two macros (Decay, Tone), each 0..1. Every mapped param uses the full macro
@@ -446,6 +514,10 @@ static float duck_atk_coeff = 0.0f;
  * in do_input_write_t0). */
 static float predelay_out[REVERB_BLOCK] CCM_ATTR;
 
+#ifdef VELVET_REVERB_HOST
+const float *host_dbg_predelay_out(void) { return predelay_out; }
+#endif
+
 /* ==== T0 per-tap Lexicon LFO state ====
  * Each early-reflection tap is displaced by a per-tap (golden-angle phase)
  * LFO so the early cluster shimmers diffusely. cos/sin tables seeded at
@@ -626,13 +698,6 @@ static uint32_t xorshift32(void)
     prng_state = x;
     return x;
 }
-
-#ifdef VELVET_REVERB_HOST
-/* Test hook (host only): reseed the tap-generation PRNG so two regenerations
- * produce an identical random layout. Lets the spectral harness vary one
- * parameter at a time with the tap positions held fixed. */
-void host_reset_prng(void) { prng_state = 0xDEADBEEF; }
-#endif
 
 /* ==== Smoothstep helper for fade curves ==== */
 static inline float smoothstep01(float x)
@@ -1502,6 +1567,9 @@ static uint16_t effgains_periodic_counter = 0;
 
 static void background_eff_gains_update(void)
 {
+#ifdef VELVET_REVERB_HOST
+    host_dbg_bg_blocks++;
+#endif
     /* Watch user-facing targets for movement. Density is fixed at MAX so only
      * the windows are watched. */
     int changed = 0;
@@ -1549,6 +1617,18 @@ static void background_eff_gains_update(void)
      * cost at one stage's recompute (~75 µs instead of ~225) so the main
      * loop's (block + bg_eff) total stays well under the 666 µs deadline
      * even while every macro is being CV-modulated. */
+#ifdef VELVET_REVERB_HOST
+    if (host_dbg_bg_blocks >= host_dbg_eff_lastblk) {
+        uint32_t gap = host_dbg_bg_blocks - host_dbg_eff_lastblk;
+        host_dbg_eff_lastblk = host_dbg_bg_blocks;
+        host_dbg_eff_calls++;
+        if (gap > 10u) {
+            host_dbg_eff_isolated++;
+            if (gap > host_dbg_eff_maxgap) host_dbg_eff_maxgap = gap;
+        }
+    }
+#endif
+
     static int stage_round_robin = 0;
     switch (stage_round_robin) {
         case 0: recompute_eff_gains_t0(); break;
@@ -1661,6 +1741,11 @@ static void do_predelay(void)
         rA = biquad_process(&pre_high_shelf_a, biquad_process(&pre_low_shelf_a, rA));
         pre_hp_a += pre_hp_coeff * (rA - pre_hp_a);
         float nodeA = px + fbEff * (rA - pre_hp_a);
+#ifdef VELVET_REVERB_HOST
+        { float m = nodeA < 0.0f ? -nodeA : nodeA;
+          if (m > host_dbg_node_peak) host_dbg_node_peak = m;
+          if (m > 4.0f) host_dbg_node_clamps++; }
+#endif
         if (nodeA > 4.0f) nodeA = 4.0f; else if (nodeA < -4.0f) nodeA = -4.0f;
         predelay_a[predelay_wh & PRE_DELAY_LINE_MASK] = nodeA;
 
@@ -1673,6 +1758,11 @@ static void do_predelay(void)
         rB = biquad_process(&pre_high_shelf_b, biquad_process(&pre_low_shelf_b, rB));
         pre_hp_b += pre_hp_coeff * (rB - pre_hp_b);
         float nodeB = px + fbEff * (rB - pre_hp_b);
+#ifdef VELVET_REVERB_HOST
+        { float m = nodeB < 0.0f ? -nodeB : nodeB;
+          if (m > host_dbg_node_peak) host_dbg_node_peak = m;
+          if (m > 4.0f) host_dbg_node_clamps++; }
+#endif
         if (nodeB > 4.0f) nodeB = 4.0f; else if (nodeB < -4.0f) nodeB = -4.0f;
         predelay_b[predelay_wh & PRE_DELAY_LINE_MASK] = nodeB;
 
@@ -1695,7 +1785,16 @@ static void do_input_write_t0(void)
      * smoothly, matching the JS behaviour as closely as int16 allows. */
     for (int i = 0; i < REVERB_BLOCK; i++) {
         uint32_t wi = ring_write_idx + (uint32_t)i;
-        t0_ring[wi & T0_RING_MASK] = soft_clip_int16(predelay_out[i] * (32768.0f * REVERB_HEADROOM));
+        float v = predelay_out[i] * (32768.0f * REVERB_HEADROOM);
+#ifdef VELVET_REVERB_HOST
+        /* Host-only: the soft knee hides how hard this stage is being driven, so
+         * record it. Saturation here is a prime whoosh suspect (see above), and
+         * it is level-dependent, which a fixed-level test would never reveal. */
+        float mag = v < 0.0f ? -v : v;
+        if (mag > host_dbg_t0_in_peak) host_dbg_t0_in_peak = mag;
+        if (mag > SOFT_KNEE_T * 32768.0f) host_dbg_t0_sat_count++;   /* knee, not over */
+#endif
+        t0_ring[wi & T0_RING_MASK] = soft_clip_int16(v);
     }
     block_write_idx = ring_write_idx;
     ring_write_idx += REVERB_BLOCK;
@@ -1853,6 +1952,9 @@ static void do_bridge_t0_to_t1(void)
 {
     for (int i = 0; i < REVERB_BLOCK; i++) {
         uint32_t wi = block_write_idx + (uint32_t)i;
+#ifdef VELVET_REVERB_HOST
+        host_note_sat(accT0[i], &host_dbg_t01_peak, &host_dbg_t01_sat);
+#endif
         t1_ring[wi & T1_RING_MASK] = soft_saturate_q15(accT0[i]);
         accT1[i] = 0;
     }
@@ -1894,6 +1996,10 @@ static void do_t1_phase(void)
 static void do_bridge_t1_to_t2(void)
 {
     for (int i = 0; i < REVERB_BLOCK; i += 2) {
+#ifdef VELVET_REVERB_HOST
+        host_note_sat(accT1[i],     &host_dbg_t12_peak, &host_dbg_t12_sat);
+        host_note_sat(accT1[i + 1], &host_dbg_t12_peak, &host_dbg_t12_sat);
+#endif
         int16_t s0 = soft_saturate_q15(accT1[i]);
         int16_t s1 = soft_saturate_q15(accT1[i + 1]);
         uint32_t packed = ((uint32_t)(uint16_t)s1 << 16) | (uint32_t)(uint16_t)s0;
@@ -1968,8 +2074,12 @@ static void do_t2_phase(void)
  * insertion point. Pregain drives the tanh; postgain trims the result.
  * Values are hardcoded to the user's chosen 2.0 / 0.5; expose as globals
  * later if they need to tweak. */
+#ifndef SAT_PRE_T2_PREGAIN
 #define SAT_PRE_T2_PREGAIN   1.1f
+#endif
+#ifndef SAT_PRE_T2_POSTGAIN
 #define SAT_PRE_T2_POSTGAIN  1.05f
+#endif
 
 /* Padé(3,2) approximation of tanh: x(27 + x²) / (27 + 9x²).
  * Accurate to <0.001 for |x| ≤ 2 (well below audible). Asymptotes to ±1/3 ×
@@ -2043,6 +2153,10 @@ static void do_finalize(void)
         /* Make up the internal headroom here (the input was attenuated by
          * REVERB_HEADROOM). soft_saturate_q15 soft-clips the cooled accumulator
          * at full scale first, so the makeup can't reintroduce a hard over. */
+#ifdef VELVET_REVERB_HOST
+        host_note_sat(accL[i], &host_dbg_out_peak, &host_dbg_out_sat);
+        host_note_sat(accR[i], &host_dbg_out_peak, &host_dbg_out_sat);
+#endif
         float rawL = (float)soft_saturate_q15(accL[i]) * REVERB_OUT_MAKEUP;
         float rawR = (float)soft_saturate_q15(accR[i]) * REVERB_OUT_MAKEUP;
         float m = 0.5f * (rawL + rawR);
@@ -2329,7 +2443,6 @@ int16_t velvet_reverb_out_right(void)
  * times so effGain magnitudes are stable. Density is fixed at MAX. */
 int  host_t2_tap_count(void)         { return t2TapCount; }
 uint16_t host_t2_effoff_l(int i)     { return effOffT2L[i]; }
-int16_t  host_t2_effgain(int i)      { return effGains_t2[i]; }
 float    host_t2_effwin(int i)       { return host_effwin_t2[i]; }
 void host_t2_set_window_samples(float w)
 {
