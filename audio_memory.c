@@ -35,8 +35,6 @@ extern const uint32_t LOOP_RAM_BASE[NUM_CHAN];
 
 extern uint8_t SAMPLESIZE;
 
-extern uint32_t target_read_addr[];
-
 extern uint32_t loop_size[NUM_CHAN];
 extern uint8_t mode[NUM_CHAN][NUM_CHAN_MODES];
 
@@ -119,8 +117,7 @@ uint32_t memory_read_varispeed(uint32_t *addr, float *frac_pos, uint8_t channel,
 		 * a boundary fallback (same scheme the varispeed slow path uses) and
 		 * the FMC poll is dropped — the controller inserts wait-states on the
 		 * bus automatically, so polling FMC_FLAG_Busy per sample was pure
-		 * overhead. target_read_addr still advances via inc/dec_addr exactly
-		 * as before (one call/sample, matching the slow path). */
+		 * overhead. */
 		const uint32_t loop_base = LOOP_RAM_BASE[channel];
 		const uint32_t loop_end  = loop_base + loop_size[channel];
 		const int reversed       = (mode[channel][REV] != 0) ^ (decrement != 0);
@@ -133,11 +130,6 @@ uint32_t memory_read_varispeed(uint32_t *addr, float *frac_pos, uint8_t channel,
 		a &= 0xFFFFFFFEu;
 
 		for (i = 0; i < num_samples; i++) {
-			if (decrement)
-				target_read_addr[channel] = dec_addr(target_read_addr[channel], channel);
-			else
-				target_read_addr[channel] = inc_addr(target_read_addr[channel], channel);
-
 			if (is16)
 				rd_buff[i] = *((int16_t *)a);
 			else
@@ -182,13 +174,6 @@ uint32_t memory_read_varispeed(uint32_t *addr, float *frac_pos, uint8_t channel,
 	uint32_t a = addr[channel] & 0xFFFFFFFEu;
 
 	for (i = 0; i < num_samples; i++) {
-		/* Target advance: keep using inc/dec_addr — only one call per output
-		 * sample, and target_read_addr is global state callers depend on. */
-		if (decrement)
-			target_read_addr[channel] = dec_addr(target_read_addr[channel], channel);
-		else
-			target_read_addr[channel] = inc_addr(target_read_addr[channel], channel);
-
 		int32_t sample0, sample1;
 
 		/* Compute next_addr inline. Common case: not at a wrap edge.
