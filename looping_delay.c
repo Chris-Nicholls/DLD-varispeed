@@ -724,11 +724,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 #ifdef DIAG_DELAY_SDRAM_TIMING
 	uint32_t _rd_t0 = DWT->CYCCNT;
 #endif
-#ifdef DIAG_BYPASS_DELAY
-	/* Diagnostic isolation: skip the SDRAM read + varispeed entirely. The
-	 * delay output (rd) is unused below when bypassed; reverb still runs. */
-	crossed_start_fade_addr = 0;
-#else
 	if (mode[channel][INF] == INF_OFF) {
 		// Calculate distance to target
 		int32_t distance = (int32_t)target_read_addr[channel] - (int32_t)read_addr[channel];
@@ -766,7 +761,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		// Freeze modes: use original memory_read
 		crossed_start_fade_addr = memory_read(read_addr, channel, rd_buff, sz/2, start_fade_addr, doing_reverse_fade[channel]);
 	}
-#endif /* DIAG_BYPASS_DELAY */
 
 
 	if (mode[channel][INF]!=INF_OFF && crossed_start_fade_addr)
@@ -813,11 +807,9 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	}
 
 	// Read crossfade destination buffer (only needed for freeze modes, not varispeed)
-#ifndef DIAG_BYPASS_DELAY
 	if (mode[channel][INF] != INF_OFF) {
 		memory_read(fade_dest_read_addr, channel, rd_buff_dest, sz/2, 0, 0 /* + mode[channel][CONTINUOUS_REVERSE]*/);
 	}
-#endif
 
 #ifdef DIAG_DELAY_SDRAM_TIMING
 	diag_log(DIAG_EVT_ISR_SDRAM_READ, DWT->CYCCNT - _rd_t0);
@@ -905,15 +897,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		// The Dry signal is just the clean signal, without any attenuation from LEVEL
 		dry = mainin;
 
-#ifdef DIAG_BYPASS_DELAY
-		/* Diagnostic isolation: skip ALL per-sample delay DSP (loop read,
-		 * regen, DC blocker, soft-clip, wet/dry mix). Feed the dry signal
-		 * straight into the reverb send + output so the reverb keeps running
-		 * at the correct rate while the delay engine costs ~nothing. */
-		mix    = mainin;
-		wr     = 0;
-		auxout = 0;
-#else
 
 		// Read from the loop and save this value so we can output it to the Delay Out jack
 		if (mode[channel][INF] == INF_OFF) {
@@ -980,7 +963,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 		else if (SAMPLESIZE==2)
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (mix) : [src] "r" (mix));
-#endif /* DIAG_BYPASS_DELAY */
 
 #ifdef REVERB_ENABLE
 		/* --- Reverb: send-style routing ---
@@ -1096,10 +1078,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 #ifdef DIAG_DELAY_SDRAM_TIMING
 	uint32_t _wr_t0 = DWT->CYCCNT;
 #endif
-#ifdef DIAG_BYPASS_DELAY
-	/* Diagnostic isolation: skip the SDRAM write-back entirely. */
-	(void)wr_buff;
-#else
 	if (mode[channel][INF] == INF_OFF || mode[channel][INF]==INF_TRANSITIONING_OFF)
 	{
 
@@ -1128,7 +1106,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			write_addr[channel] = fade_dest_write_addr[channel];
 		}
 	}
-#endif /* DIAG_BYPASS_DELAY */
 
 #ifdef DIAG_DELAY_SDRAM_TIMING
 	diag_log(DIAG_EVT_ISR_SDRAM_WRITE, DWT->CYCCNT - _wr_t0);

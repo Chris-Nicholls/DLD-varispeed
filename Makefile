@@ -154,11 +154,6 @@ CFLAGS += -DMAX_T2_TAPS=32
 # becomes an FSK-modulated audio stream of cycle-count events. Record
 # the send jack at 48 kHz and decode with test/diag_decode.py.
 #CFLAGS += -DDIAG_FSK_ENABLE
-# Diagnostic isolation: strip the delay engine down to a near-empty ISR
-# (no SDRAM read/write, no per-sample delay DSP) while the codec + reverb
-# push/out keep running. If the reverb STILL corrupts with this on, the
-# cause is poll/main-loop, not delay-ISR preemption. Uncomment to test:
-#CFLAGS += -DDIAG_BYPASS_DELAY
 
 # Optional-build flags (empty unless PROFILE / NODMA / NOLIM / BISECT is set —
 # see the blocks near the top). Appended here because CFLAGS is assigned with
