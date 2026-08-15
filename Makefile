@@ -10,6 +10,65 @@ PERIPH = stm32/periph
 
 BUILDDIR = build
 
+# ---- Profiling firmware ---------------------------------------------------
+# Answers "where does the reverb block actually spend its time", which the
+# normal build cannot: its diag thresholds only log outliers, so every
+# distribution is biased toward its own tail. PROFILE=1 instead logs every
+# stage of one-in-128 blocks with zero thresholds — an unbiased sample — and
+# adds a T2 breakdown into DMA wait / DMA kick / convolution.
+#
+#   make PROFILE=1            instrumented build (FSK stream on right SEND)
+#   make PROFILE=1 NODMA=1    same, but T2 prefetch replaced by CPU copies
+#   make PROFILE=1 flash      flash the instrumented build
+#
+# Build both and compare reverb_T2 to settle whether the DMA prefetch is
+# earning its keep. Objects go to build_profile/ so the normal build and its
+# map file are never clobbered.
+# ---- Pre-T2 saturator off ---------------------------------------------------
+# make BISECT=t2sat flash   builds normal, listenable firmware with the always-on
+# pre-T2 tanh removed. That saturator is the dominant source of broadband hash in
+# the harness (8 dB at matched loudness), so its drive is a character decision
+# that has to be made by ear; this is the A/B for it.
+ifeq ($(BISECT),t2sat)
+BISECT_FLAGS = -DDIAG_BISECT_NO_T2SAT
+BUILDDIR     = build_bisect_t2sat
+endif
+
+# ---- T2 DMA off ------------------------------------------------------------
+# NODMA=1 replaces the T2 SDRAM prefetch with plain CPU copies, with no
+# profiling and no FSK, so it is a normal listenable firmware. This is the single
+# most valuable A/B for an artifact that no host test can reproduce: the DMA is
+# the largest behavioural difference between the device and the host build (the
+# host just memcpy's). If the impulses vanish here, the T2 DMA path is
+# implicated; if they persist, it is exonerated and the pre-delay/SDRAM side is
+# next. Costs some CPU (~1k cycles/block) but stays inside the deadline.
+# (defined after the PROFILE block below, which also consumes NODMA)
+
+PROFILE ?= 0
+NODMA   ?= 0
+ifeq ($(PROFILE),1)
+PROFILE_FLAGS  = -DDIAG_FSK_ENABLE -DDIAG_REVERB_PROFILE
+# 127, not 128: a prime divisor cannot phase-lock with the 16-block macro
+# throttle, which is what previously biased the reverb_morph figure.
+PROFILE_FLAGS += -DDIAG_PROFILE_DIVISOR=127
+ifeq ($(NODMA),1)
+BUILDDIR       = build_profile_nodma
+else
+BUILDDIR       = build_profile
+endif
+endif
+
+# NODMA applies to both a profile build (compare reverb_T2 between the two) and a
+# plain listenable build (A/B the impulses by ear). The flag is set here for both;
+# only the non-profile case needs its own build dir, since PROFILE already picked
+# build_profile_nodma above.
+ifeq ($(NODMA),1)
+NODMA_FLAGS = -DDMA2_DISABLED_FOR_DIAGNOSTIC=1
+ifneq ($(PROFILE),1)
+BUILDDIR    = build_nodma
+endif
+endif
+
 SOURCES += $(wildcard $(PERIPH)/src/*.c)
 SOURCES += $(DEVICE)/src/$(STARTUP)
 SOURCES += $(DEVICE)/src/$(SYSTEM)
@@ -100,10 +159,16 @@ CFLAGS += -DMAX_T2_TAPS=32
 # push/out keep running. If the reverb STILL corrupts with this on, the
 # cause is poll/main-loop, not delay-ISR preemption. Uncomment to test:
 #CFLAGS += -DDIAG_BYPASS_DELAY
+
+# Optional-build flags (empty unless PROFILE / NODMA / NOLIM / BISECT is set —
+# see the blocks near the top). Appended here because CFLAGS is assigned with
+# '=' above, which would discard anything added before that point.
+CFLAGS += $(PROFILE_FLAGS) $(NODMA_FLAGS) $(BISECT_FLAGS)
+
 AFLAGS  = -mlittle-endian -mthumb -mcpu=cortex-m4 
 
 LDSCRIPT = $(DEVICE)/$(LOADFILE)
-LFLAGS  = -Wl,-Map,main.map -T $(LDSCRIPT) -flto -O2 -nostartfiles \
+LFLAGS  = -Wl,-Map,$(BUILDDIR)/main.map -T $(LDSCRIPT) -flto -O2 -nostartfiles \
            -mlittle-endian -mthumb -mcpu=cortex-m4 -mfloat-abi=hard -mfpu=fpv4-sp-d16
 
 # Math library for velvet reverb (sinf, cosf, expf, sqrtf, powf)
@@ -142,7 +207,7 @@ flash: $(BIN)
 	st-flash write $(BIN) 0x8008000
 
 clean:
-	rm -rf build
+	rm -rf build build_profile build_profile_nodma
 	
 wav: fsk-wav
 

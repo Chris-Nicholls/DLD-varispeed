@@ -721,7 +721,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	// reversed direction, so we should continue reading from rd_buff in the same direction (which is now !REV),
 	// and cross fade towards dest_rd_buff being read in the direction of REV
 
-#ifdef DIAG_FSK_ENABLE
+#ifdef DIAG_DELAY_SDRAM_TIMING
 	uint32_t _rd_t0 = DWT->CYCCNT;
 #endif
 #ifdef DIAG_BYPASS_DELAY
@@ -819,7 +819,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	}
 #endif
 
-#ifdef DIAG_FSK_ENABLE
+#ifdef DIAG_DELAY_SDRAM_TIMING
 	diag_log(DIAG_EVT_ISR_SDRAM_READ, DWT->CYCCNT - _rd_t0);
 #endif
 
@@ -1093,7 +1093,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 	//Write a block to memory
 
-#ifdef DIAG_FSK_ENABLE
+#ifdef DIAG_DELAY_SDRAM_TIMING
 	uint32_t _wr_t0 = DWT->CYCCNT;
 #endif
 #ifdef DIAG_BYPASS_DELAY
@@ -1130,7 +1130,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	}
 #endif /* DIAG_BYPASS_DELAY */
 
-#ifdef DIAG_FSK_ENABLE
+#ifdef DIAG_DELAY_SDRAM_TIMING
 	diag_log(DIAG_EVT_ISR_SDRAM_WRITE, DWT->CYCCNT - _wr_t0);
 #endif
 

@@ -461,6 +461,41 @@ static inline void dwt_init(void)
     DWT->CYCCNT = 0;
     DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
 }
+
+/* ==== Stage timing (pure compute, ISR time removed) ====
+ *
+ * A stage's cost is wall time minus the codec-ISR time that preempted it. Taking
+ * that as two independent reads is racy: if an ISR lands BETWEEN reading CYCCNT
+ * and reading diag_isr_cycles, one delta contains that ISR and the other does
+ * not. Depending on which end it happens at, the result is either inflated or
+ * driven negative — and being unsigned, negative wraps to ~4e9 and saturates at
+ * DIAG_CYCLES_MASK, i.e. a fake 6241.5 us. That is not a subtle skew: it
+ * manufactures the largest possible outlier out of nothing, in exactly the p99
+ * column used to hunt overruns, which is worse than having no measurement.
+ *
+ * So sample the pair atomically, and clamp instead of wrapping if the two still
+ * disagree. Interrupts are masked for two register reads only. */
+static inline uint32_t diag_stage_start(uint32_t *isr_out)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t c = DWT->CYCCNT;
+    *isr_out = diag_isr_cycles;
+    if (!primask) __enable_irq();
+    return c;
+}
+
+static inline uint32_t diag_stage_cycles(uint32_t cyc0, uint32_t isr0)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t c = DWT->CYCCNT;
+    uint32_t i = diag_isr_cycles;
+    if (!primask) __enable_irq();
+    uint32_t wall = c - cyc0;
+    uint32_t isr  = i - isr0;
+    return (wall > isr) ? (wall - isr) : 0u;
+}
 #endif
 
 /* ==== Input / output ==== */
@@ -661,11 +696,29 @@ static inline void dma2_fetch_tap(uint32_t tapOffset, int16_t *dst)
  * vanish with this, T2's DMA bus contention on SDRAM with channel 1's
  * audio reads is the source (they share the upper SDRAM half). Costs CPU
  * cycles (~16 word reads × 32 taps × 2 passes per block ≈ 1k cycles), so
- * expect slightly higher reverb_T2 timing but well under the deadline. */
+ * expect slightly higher reverb_T2 timing but well under the deadline.
+ *
+ * Overridable from the Makefile (`make PROFILE=1 NODMA=1`) so the DMA and
+ * CPU-copy paths can be A/B'd by comparing reverb_T2 between two builds. */
+#ifndef DMA2_DISABLED_FOR_DIAGNOSTIC
 #define DMA2_DISABLED_FOR_DIAGNOSTIC  0   /* revert: not the cause */
+#endif
+
+/* Profile-build accumulators, summed across all 64 tap fetches of one block
+ * (32 taps x L/R) and emitted by do_t2_phase. Reading DWT->CYCCNT four times
+ * per tap costs roughly 1k cycles a block, so a profile build's reverb_T2 is
+ * inflated by ~8% relative to a normal build — compare T2 totals only between
+ * builds of the same kind. The wait/kick split is unaffected. */
+#ifdef DIAG_REVERB_PROFILE
+static uint32_t t2_dma_wait_cyc = 0;
+static uint32_t t2_dma_kick_cyc = 0;
+#endif
 
 static inline void dma2_kick(const int16_t *src, int16_t *dst, uint32_t count)
 {
+#ifdef DIAG_REVERB_PROFILE
+    uint32_t _k0 = DWT->CYCCNT;
+#endif
 #if DMA2_DISABLED_FOR_DIAGNOSTIC
     for (uint32_t i = 0; i < count; i++) dst[i] = src[i];
 #else
@@ -677,14 +730,23 @@ static inline void dma2_kick(const int16_t *src, int16_t *dst, uint32_t count)
     DMA2_Stream1->NDTR = count;
     DMA2_Stream1->CR  |= DMA_SxCR_EN;
 #endif
+#ifdef DIAG_REVERB_PROFILE
+    t2_dma_kick_cyc += DWT->CYCCNT - _k0;
+#endif
 }
 static inline void dma2_wait(void)
 {
+#ifdef DIAG_REVERB_PROFILE
+    uint32_t _w0 = DWT->CYCCNT;
+#endif
 #if DMA2_DISABLED_FOR_DIAGNOSTIC
     /* memcpy is synchronous — nothing to wait for. */
 #else
     while ((DMA2_Stream1->CR & DMA_SxCR_EN) && !(DMA2->LISR & DMA_LISR_TCIF1)) {}
     __DMB();
+#endif
+#ifdef DIAG_REVERB_PROFILE
+    t2_dma_wait_cyc += DWT->CYCCNT - _w0;
 #endif
 }
 static inline void dma2_fetch_tap(uint32_t tapOffset, int16_t *dst)
@@ -1791,6 +1853,10 @@ static void do_bridge_t1_to_t2(void)
 static void do_t2_phase(void)
 {
     int count = t2TapCount;
+#ifdef DIAG_REVERB_PROFILE
+    t2_dma_wait_cyc = 0;
+    t2_dma_kick_cyc = 0;
+#endif
     if (count == 0) return;
 
     /* === L pass === */
@@ -1836,6 +1902,11 @@ static void do_t2_phase(void)
             accR[i+1] = qadd_sat(accR[i+1], p1);
         }
     }
+
+#ifdef DIAG_REVERB_PROFILE
+    DIAG_LOG_BLK(DIAG_EVT_T2_DMA_WAIT, t2_dma_wait_cyc);
+    DIAG_LOG_BLK(DIAG_EVT_T2_DMA_KICK, t2_dma_kick_cyc);
+#endif
 }
 
 /* Pre-T2 tanh saturation. Applied to the freshly-written block of t2_ring
@@ -1995,7 +2066,22 @@ void velvet_reverb_poll(void)
      * poll-short-circuit test, which was confounded. */
 
 #ifndef VELVET_REVERB_HOST
-    uint32_t t0 = DWT->CYCCNT; uint32_t i_blk_0 = diag_isr_cycles;
+#ifdef DIAG_REVERB_PROFILE
+    /* Pick the one-in-N blocks that get fully instrumented this pass. Chosen
+     * before any timing starts so every stage below agrees on whether it is
+     * being sampled, which is what lets the per-stage numbers be summed and
+     * reconciled against the block total. */
+    /* Modulo, not a power-of-two mask, so the divisor can be chosen coprime with
+     * the other periodic work in the block. With a mask the divisor must be a
+     * power of two, and 128 shares all its factors with the 16-block macro
+     * throttle in update_morph_state: the sampled blocks then land on the same
+     * phase every time and the sample is not of the block population but of one
+     * particular kind of block. That aliasing is what made reverb_morph look far
+     * more expensive than it is. A prime divisor cannot phase-lock to anything. */
+    static uint32_t prof_block_ctr = 0;
+    diag_sample_block = ((++prof_block_ctr % DIAG_PROFILE_DIVISOR) == 0u);
+#endif
+    uint32_t i_blk_0; uint32_t t0 = diag_stage_start(&i_blk_0);
     /* Wall-clock lag from block-ready to poll pickup: how long the fresh input
      * block sat waiting on the main loop (includes any ISR + other main-loop
      * work that delayed the reverb). Large values => main loop not reaching
@@ -2009,43 +2095,43 @@ void velvet_reverb_poll(void)
     /* Cheap per-block morph update (window/decay IIR + pre-delay time smooth).
      * The heavier effGains recompute is deferred to outside the block timer. */
 #ifndef VELVET_REVERB_HOST
-    uint32_t t_morph_0 = DWT->CYCCNT; uint32_t i_morph_0 = diag_isr_cycles;
+    uint32_t i_morph_0; uint32_t t_morph_0 = diag_stage_start(&i_morph_0);
 #endif
     update_morph_state();
 #ifndef VELVET_REVERB_HOST
-    diag_log(DIAG_EVT_REVERB_MORPH, (DWT->CYCCNT - t_morph_0) - (diag_isr_cycles - i_morph_0));
+    DIAG_LOG_BLK(DIAG_EVT_REVERB_MORPH, diag_stage_cycles(t_morph_0, i_morph_0));
 #endif
 
 #if REVERB_STAGE >= 1
     /* Pre-delay sustain engine runs on the input block, producing the
      * (feedforward) cascade input. Replaces the old per-stage/global recirc. */
 #ifndef VELVET_REVERB_HOST
-    uint32_t t_pre_0 = DWT->CYCCNT; uint32_t i_pre_0 = diag_isr_cycles;
+    uint32_t i_pre_0; uint32_t t_pre_0 = diag_stage_start(&i_pre_0);
 #endif
     do_predelay();
 #ifndef VELVET_REVERB_HOST
-    diag_log(DIAG_EVT_REVERB_PREDELAY, (DWT->CYCCNT - t_pre_0) - (diag_isr_cycles - i_pre_0));
+    DIAG_LOG_BLK(DIAG_EVT_REVERB_PREDELAY, diag_stage_cycles(t_pre_0, i_pre_0));
 #endif
     do_input_write_t0();
 #endif
 #if REVERB_STAGE >= 2
     {
 #ifndef VELVET_REVERB_HOST
-        uint32_t t0_t0 = DWT->CYCCNT; uint32_t i0_t0 = diag_isr_cycles;
+        uint32_t i0_t0; uint32_t t0_t0 = diag_stage_start(&i0_t0);
 #endif
         do_t0_phase();
 #ifndef VELVET_REVERB_HOST
-        diag_log(DIAG_EVT_REVERB_T0, (DWT->CYCCNT - t0_t0) - (diag_isr_cycles - i0_t0));
+        DIAG_LOG_BLK(DIAG_EVT_REVERB_T0, diag_stage_cycles(t0_t0, i0_t0));
 #endif
         do_bridge_t0_to_t1();
     }
     {
 #ifndef VELVET_REVERB_HOST
-        uint32_t t1_t0 = DWT->CYCCNT; uint32_t i1_t0 = diag_isr_cycles;
+        uint32_t i1_t0; uint32_t t1_t0 = diag_stage_start(&i1_t0);
 #endif
         do_t1_phase();
 #ifndef VELVET_REVERB_HOST
-        diag_log(DIAG_EVT_REVERB_T1, (DWT->CYCCNT - t1_t0) - (diag_isr_cycles - i1_t0));
+        DIAG_LOG_BLK(DIAG_EVT_REVERB_T1, diag_stage_cycles(t1_t0, i1_t0));
 #endif
         do_bridge_t1_to_t2();
     }
@@ -2053,31 +2139,36 @@ void velvet_reverb_poll(void)
 #if REVERB_STAGE >= 3
     {
 #ifndef VELVET_REVERB_HOST
-        uint32_t t2_t0 = DWT->CYCCNT; uint32_t i2_t0 = diag_isr_cycles;
+        uint32_t i2_t0; uint32_t t2_t0 = diag_stage_start(&i2_t0);
 #endif
         do_t2_phase();
         /* Pre-T2 tanh sat — saturates the Tm bridge content in t2_ring before
          * subsequent block reads it. Runs unconditionally (always-on). */
+#ifndef DIAG_BISECT_NO_T2SAT
+        /* Bisection: this rewrites ring content in place that 32 T2 taps go on
+         * re-reading for the next 10.9 s, so a fault here would sound reverberant
+         * rather than like a bare click. */
         apply_pre_t2_sat();
+#endif
 #ifndef VELVET_REVERB_HOST
-        diag_log(DIAG_EVT_REVERB_T2, (DWT->CYCCNT - t2_t0) - (diag_isr_cycles - i2_t0));
+        DIAG_LOG_BLK(DIAG_EVT_REVERB_T2, diag_stage_cycles(t2_t0, i2_t0));
 #endif
     }
 #endif
 #if REVERB_STAGE >= 4
 #ifndef VELVET_REVERB_HOST
-    uint32_t t_fin_0 = DWT->CYCCNT; uint32_t i_fin_0 = diag_isr_cycles;
+    uint32_t i_fin_0; uint32_t t_fin_0 = diag_stage_start(&i_fin_0);
 #endif
     do_finalize();
 #ifndef VELVET_REVERB_HOST
-    diag_log(DIAG_EVT_REVERB_FINALIZE, (DWT->CYCCNT - t_fin_0) - (diag_isr_cycles - i_fin_0));
+    DIAG_LOG_BLK(DIAG_EVT_REVERB_FINALIZE, diag_stage_cycles(t_fin_0, i_fin_0));
 #endif
 #endif
 
 #ifndef VELVET_REVERB_HOST
-    diag_log(DIAG_EVT_REVERB_BLOCK, DWT->CYCCNT - t0);
+    DIAG_LOG_BLK(DIAG_EVT_REVERB_BLOCK, DWT->CYCCNT - t0);
     /* ISR cycles that preempted this block (wall-clock block − this = pure reverb compute). */
-    diag_log(DIAG_EVT_REVERB_ISR_IN_BLOCK, diag_isr_cycles - i_blk_0);
+    DIAG_LOG_BLK(DIAG_EVT_REVERB_ISR_IN_BLOCK, diag_isr_cycles - i_blk_0);
 #endif
 
     block_ready = 0;
@@ -2088,11 +2179,11 @@ void velvet_reverb_poll(void)
      * buffer's lead time we miss a deadline even though the per-stage
      * numbers look fine. */
 #ifndef VELVET_REVERB_HOST
-    uint32_t t_bg_0 = DWT->CYCCNT; uint32_t i_bg_0 = diag_isr_cycles;
+    uint32_t i_bg_0; uint32_t t_bg_0 = diag_stage_start(&i_bg_0);
 #endif
     background_eff_gains_update();
 #ifndef VELVET_REVERB_HOST
-    diag_log(DIAG_EVT_REVERB_BG_EFF, (DWT->CYCCNT - t_bg_0) - (diag_isr_cycles - i_bg_0));
+    DIAG_LOG_BLK(DIAG_EVT_REVERB_BG_EFF, diag_stage_cycles(t_bg_0, i_bg_0));
 #endif
 }
 

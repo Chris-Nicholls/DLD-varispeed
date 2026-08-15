@@ -19,6 +19,14 @@ volatile uint32_t diag_log_tail    = 0;
 volatile uint32_t diag_log_dropped = 0;
 volatile uint32_t diag_evt_total[DIAG_EVT_COUNT] = { 0 };
 
+volatile uint8_t diag_sample_block = 0u;
+
+#ifdef DIAG_REVERB_PROFILE
+/* Profile build: thresholds are all zero because the rate limiting is done by
+ * block sampling instead (see DIAG_LOG_BLK / DIAG_PROFILE_DIVISOR). Filtering
+ * on magnitude here would bias every distribution toward its own tail. */
+volatile uint32_t diag_thresh_cycles[DIAG_EVT_COUNT] = { 0 };
+#else
 volatile uint32_t diag_thresh_cycles[DIAG_EVT_COUNT] = {
     /* Outlier capture: only log events that exceed the budget so the FSK
      * channel stays inside its ~300 ev/s envelope. 168 MHz CPU; 1 µs ≈ 168
@@ -40,6 +48,7 @@ volatile uint32_t diag_thresh_cycles[DIAG_EVT_COUNT] = {
     [DIAG_EVT_OUTPUT_MISS]      = 0u,      /* always log (emitted ~1/s): cumulative bitcrush miss count */
     [DIAG_EVT_POLL_LATENCY]     = 0u,      /* always log: block_ready->poll latency */
 };
+#endif /* DIAG_REVERB_PROFILE */
 
 volatile uint8_t diag_log_enabled = 1;
 

@@ -40,6 +40,49 @@ typedef enum {
     DIAG_EVT_COUNT           = 16u,
 } diag_evt_t;
 
+/* ==== Reverb profiling build (-DDIAG_REVERB_PROFILE) ====
+ *
+ * The default build logs only OUTLIERS (see diag_thresh_cycles) so the FSK
+ * link stays inside its ~235 event/s envelope. That is the right filter for
+ * hunting dropouts but the wrong one for profiling: it tells you about the
+ * tail and nothing about the mean.
+ *
+ * Profile mode instead logs EVERY stage of one-in-N blocks with all
+ * thresholds at zero, which is an unbiased sample of the block population.
+ * At the default divisor of 128 that is 1500/128 x ~12 events = ~140 ev/s,
+ * comfortably inside the link budget.
+ *
+ * The 4-bit on-wire event field allows only 16 slots and all are taken, so
+ * the two delay-engine SDRAM events are repurposed to decompose the T2
+ * stage. looping_delay.c stops emitting them in this build (they measure
+ * the delay engine, not the reverb).
+ *
+ *     T2 MAC time = reverb_T2 - t2_dma_wait - t2_dma_kick
+ *
+ * t2_dma_wait is the headline number: it is how long do_t2_phase sits in
+ * dma2_wait's spin loop. Near zero means the prefetch is fully hidden
+ * behind the convolution and the DMA is doing its job. Large means the
+ * transfer is slower than the arithmetic it overlaps, i.e. the stream is
+ * the bottleneck rather than the compute. */
+#ifndef DIAG_PROFILE_DIVISOR
+/* Prime, deliberately: the sampler uses modulo (not a power-of-two mask) so the
+ * divisor can be coprime with the block's other periodic work. See the sampler
+ * in velvet_reverb.c for why phase-locking biased the numbers. */
+#define DIAG_PROFILE_DIVISOR 127u
+#endif
+
+#ifdef DIAG_REVERB_PROFILE
+#define DIAG_EVT_T2_DMA_WAIT  DIAG_EVT_ISR_SDRAM_READ    /* slot 12 repurposed */
+#define DIAG_EVT_T2_DMA_KICK  DIAG_EVT_ISR_SDRAM_WRITE   /* slot 13 repurposed */
+#endif
+
+/* Slots 12/13 carry the delay engine's SDRAM timings in a normal FSK build and
+ * the reverb's T2 DMA breakdown in a profile build, so only one producer can
+ * be active at a time. looping_delay.c gates on this. */
+#if defined(DIAG_FSK_ENABLE) && !defined(DIAG_REVERB_PROFILE)
+#define DIAG_DELAY_SDRAM_TIMING 1
+#endif
+
 #define DIAG_CYCLES_BITS   20u
 #define DIAG_CYCLES_MASK   ((1u << DIAG_CYCLES_BITS) - 1u)
 #define DIAG_EVT_SHIFT     DIAG_CYCLES_BITS
@@ -86,6 +129,22 @@ static inline void diag_log(diag_evt_t evt, uint32_t cycles)
     }
     if (!primask) __enable_irq();
 }
+
+/* Set once per reverb block by velvet_reverb_poll in profile builds: non-zero
+ * on the one-in-DIAG_PROFILE_DIVISOR blocks that get fully instrumented.
+ * Sampling whole blocks (rather than individual events) keeps every stage of
+ * a sampled block mutually consistent, so the per-stage numbers can be summed
+ * and checked against the block total. */
+extern volatile uint8_t diag_sample_block;
+
+/* Per-block stage logging. In a profile build this fires only on sampled
+ * blocks; otherwise it is the ordinary threshold-filtered diag_log. */
+#ifdef DIAG_REVERB_PROFILE
+#define DIAG_LOG_BLK(evt, cycles) \
+    do { if (diag_sample_block) diag_log((evt), (cycles)); } while (0)
+#else
+#define DIAG_LOG_BLK(evt, cycles) diag_log((evt), (cycles))
+#endif
 
 /* Consumer: single FSK TX caller. */
 static inline int diag_log_pop_packed(uint32_t *out)
