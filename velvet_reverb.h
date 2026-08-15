@@ -93,6 +93,14 @@ extern float host_predelay_b_storage[PRE_DELAY_LINE_SAMPLES];
 #define REVERB_BLOCK         16
 #define REVERB_OUT_BLOCK     (REVERB_BLOCK * 2)
 
+/* Depth of the ISR-to-main-loop input queue, in blocks. (REVERB_IN_NBUF - 1)
+ * blocks is how late the main loop may be before an input block is dropped; see
+ * the rationale at in_ring in velvet_reverb.c. Here rather than in the .c so the
+ * host harness can report the tolerance it is measuring. */
+#ifndef REVERB_IN_NBUF
+#define REVERB_IN_NBUF       16
+#endif
+
 /* ---- Tap limits (compile-time upper bounds; runtime target counts can go below) ---- */
 #ifndef MAX_T0_TAPS
 #define MAX_T0_TAPS  40
@@ -197,6 +205,15 @@ int16_t velvet_reverb_out_left(void);
 int16_t velvet_reverb_out_right(void);
 
 void velvet_reverb_poll(void);
+
+/* Count of input blocks discarded because poll had not consumed the previous
+ * one — i.e. the main loop was late by more than one block period. Each drop
+ * splices REVERB_BLOCK samples out of the reverb's input and is audible as a
+ * whoosh, so this is the objective measure of how much main-loop lateness the
+ * engine tolerates. Exposed for the host harness. */
+extern volatile uint32_t input_drop_count;
+/* Peak input-queue occupancy in blocks, out of (REVERB_IN_NBUF - 1) usable. */
+extern volatile uint8_t input_queue_max;
 
 /* ---- Macro system ----
  *

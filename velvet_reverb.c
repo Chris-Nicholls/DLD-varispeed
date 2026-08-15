@@ -498,16 +498,56 @@ static inline uint32_t diag_stage_cycles(uint32_t cyc0, uint32_t isr0)
 }
 #endif
 
-/* ==== Input / output ==== */
-static int16_t input_buf_A[REVERB_BLOCK];
-static int16_t input_buf_B[REVERB_BLOCK];
-static int16_t *input_fill  = input_buf_A;
-static int16_t *input_ready = input_buf_B;
+/* ==== Input queue ====
+ *
+ * The codec ISR fills a block and hands it to poll, which runs in the main loop.
+ * This used to be a two-buffer swap guarded by a single `block_ready` flag, and
+ * that gave the main loop exactly ONE block period — 666 us — to collect a block
+ * before the next one had nowhere to go and was thrown away. A discarded block
+ * splices REVERB_BLOCK samples out of the reverb's input, and the cascade
+ * diffuses that step into an audible whoosh. Since the main loop only has to
+ * overrun once for this to fire, it presented as an occasional whoosh rather
+ * than anything obviously correlated with load.
+ *
+ * A queue of REVERB_IN_NBUF blocks turns that hard 666 us deadline into
+ * (REVERB_IN_NBUF - 1) block periods of slack. Note what this does NOT cost:
+ * poll still consumes a block as soon as one is available, so steady-state
+ * latency is unchanged at one block. The depth is only drawn upon when the main
+ * loop runs late, and it drains again as soon as it catches up — latency is
+ * transient, proportional to actual lateness, and bounded by the depth. That is
+ * the opposite of the output ring, where the cushion is a standing cost.
+ *
+ * Lock-free single-producer/single-consumer via monotonic sequence counters:
+ * the ISR owns in_wr_seq, poll owns in_rd_seq, and neither writes the other's.
+ * Depth in flight is (in_wr_seq - in_rd_seq), which is correct across counter
+ * wrap because both are unsigned. The producer publishes by incrementing
+ * in_wr_seq only after the samples are written, with a barrier between, so poll
+ * can never observe a sequence number for a block that is not yet complete.
+ *
+ * Sized against measured lateness: poll latency on hardware peaked at 2.2 ms,
+ * and the harness confirms the depth is the binding limit (stalls below it are
+ * absorbed, stalls above it still drop). 16 blocks is 512 bytes for 10 ms of
+ * tolerance — roughly 4x the observed worst case, which is the right trade when
+ * a single overrun is audible and the memory is this cheap. REVERB_IN_NBUF is in
+ * the header, and overridable so the harness can A/B against the old one-block
+ * behaviour by building with 2. */
+
+/* Power of two keeps the modulo in the ISR an AND. */
+typedef char in_nbuf_pow2_check[((REVERB_IN_NBUF & (REVERB_IN_NBUF - 1)) == 0) ? 1 : -1];
+
+static int16_t in_ring[REVERB_IN_NBUF][REVERB_BLOCK];
+static volatile uint32_t in_wr_seq = 0;   /* written by ISR only */
+static volatile uint32_t in_rd_seq = 0;   /* written by poll only */
+static int16_t *input_ready = in_ring[0]; /* block poll is currently reading */
 static uint8_t  input_fill_idx = 0;
 static int32_t push_acc = 0;
 static uint8_t push_phase = 0;
 static uint32_t block_write_idx = 0;
-static volatile uint8_t block_ready = 0;
+/* High-water mark of queue occupancy: how much of the slack the main loop
+ * actually uses, so the depth can be sized from measurement rather than guessed
+ * at. Not a diag event because the on-wire event field is 4 bits and all 16
+ * slots are taken; read it from the debugger or the host harness. */
+volatile uint8_t input_queue_max = 0;
 
 /* ==== Output-underrun (bitcrush) instrumentation ====
  * blocks_produced is the monotonic count of fully-written output blocks; the
@@ -519,8 +559,15 @@ static volatile uint8_t block_ready = 0;
  * how long it sat before the main loop picked it up. */
 static volatile uint32_t blocks_produced   = 0;
 static volatile uint32_t output_miss_count = 0;
+/* Input blocks discarded because poll had not consumed the previous one. See
+ * the drop path in velvet_reverb_push_sample. */
+volatile uint32_t input_drop_count = 0;
 #ifndef VELVET_REVERB_HOST
-static volatile uint32_t block_ready_cyc   = 0;
+/* Per-slot, not a single global: poll consumes the oldest queued block while the
+ * ISR publishes the newest, so one shared timestamp would report the age of a
+ * block other than the one being processed and hide exactly the lateness this
+ * queue exists to absorb. */
+static volatile uint32_t in_ready_cyc[REVERB_IN_NBUF];
 #endif
 
 static int32_t accT0[REVERB_BLOCK] CCM_ATTR;
@@ -1023,8 +1070,9 @@ void velvet_reverb_init(void)
 
     for (int i = 0; i < REVERB_BLOCK; i++) {
         accT0[i] = 0; accT1[i] = 0; accL[i] = 0; accR[i] = 0;
-        input_buf_A[i] = 0; input_buf_B[i] = 0;
     }
+    for (int b = 0; b < REVERB_IN_NBUF; b++)
+        for (int i = 0; i < REVERB_BLOCK; i++) in_ring[b][i] = 0;
     for (int b = 0; b < REVERB_OUT_NBUF; b++) {
         for (int i = 0; i < REVERB_OUT_BLOCK; i++) {
             outL[b][i] = 0; outR[b][i] = 0;
@@ -1032,6 +1080,11 @@ void velvet_reverb_init(void)
     }
     prev_out_L = 0; prev_out_R = 0;
     push_acc = 0; push_phase = 0;
+    in_wr_seq = 0; in_rd_seq = 0;
+    input_fill_idx = 0;
+    input_ready = in_ring[0];
+    input_queue_max = 0;
+    input_drop_count = 0;
     blocks_produced = 0;
     rd_seq_L = 0; rd_seq_R = 0;
     reader_buf_L = 0; reader_buf_R = 0;
@@ -2021,6 +2074,7 @@ static void do_finalize(void)
 /* ==== ISR-side: input buffer fill ==== */
 void velvet_reverb_push_sample(int16_t input)
 {
+
     push_acc += input;
     push_phase ^= 1;
     if (push_phase) return;
@@ -2028,20 +2082,33 @@ void velvet_reverb_push_sample(int16_t input)
     int16_t avg = (int16_t)(push_acc >> 1);
     push_acc = 0;
 
-    input_fill[input_fill_idx] = avg;
+    const uint32_t wseq = in_wr_seq;
+    in_ring[wseq % REVERB_IN_NBUF][input_fill_idx] = avg;
     input_fill_idx++;
 
     if (input_fill_idx >= REVERB_BLOCK) {
         input_fill_idx = 0;
-        if (!block_ready) {
-            int16_t *tmp = input_fill;
-            input_fill = input_ready;
-            input_ready = tmp;
-            block_ready = 1;
+        /* Keep one slot reserved to fill into, so publishing can never land on
+         * the slot poll is reading. Hence NBUF-1 usable depth. */
+        uint32_t depth = wseq - in_rd_seq;
+        if (depth < (uint32_t)(REVERB_IN_NBUF - 1)) {
+            if ((uint8_t)(depth + 1u) > input_queue_max)
+                input_queue_max = (uint8_t)(depth + 1u);
 #ifndef VELVET_REVERB_HOST
-            block_ready_cyc = DWT->CYCCNT;
+            in_ready_cyc[wseq % REVERB_IN_NBUF] = DWT->CYCCNT;
 #endif
+            /* Publish only after the samples above are visible. */
+            __DMB();
+            in_wr_seq = wseq + 1u;
         } else {
+            /* Queue full: the main loop is genuinely behind, not merely jittery.
+             * The block just filled is discarded, which splices REVERB_BLOCK
+             * samples out of the reverb's input, and the cascade diffuses that
+             * step into an audible whoosh. With the queue this now takes
+             * (REVERB_IN_NBUF - 1) block periods of lateness rather than one, so
+             * a nonzero count here means real sustained overload rather than
+             * ordinary scheduling jitter. */
+            input_drop_count++;
 #ifndef VELVET_REVERB_HOST
             diag_log(DIAG_EVT_REVERB_DROP, 0);
 #endif
@@ -2056,7 +2123,10 @@ void velvet_reverb_push_sample(int16_t input)
 
 void velvet_reverb_poll(void)
 {
-    if (!block_ready) return;
+    /* Nothing queued? Unsigned compare is deliberate: it stays correct when the
+     * sequence counters wrap. */
+    if (in_wr_seq == in_rd_seq) return;
+    input_ready = in_ring[in_rd_seq % REVERB_IN_NBUF];
 
     /* DIAGNOSTIC RESULT (reverb send = 0): clicks DISAPPEAR. The clicks are
      * in the reverb path — either the reverb amplifying a step in its input
@@ -2086,7 +2156,7 @@ void velvet_reverb_poll(void)
      * block sat waiting on the main loop (includes any ISR + other main-loop
      * work that delayed the reverb). Large values => main loop not reaching
      * poll promptly, which lets the output reader run dry. */
-    diag_log(DIAG_EVT_POLL_LATENCY, t0 - block_ready_cyc);
+    DIAG_LOG_BLK(DIAG_EVT_POLL_LATENCY, t0 - in_ready_cyc[in_rd_seq % REVERB_IN_NBUF]);
     /* Emit the cumulative bitcrush miss count ~once/sec (1500 blocks/s). */
     static uint16_t miss_emit_ctr = 0;
     if (++miss_emit_ctr >= 1500u) { miss_emit_ctr = 0; diag_log(DIAG_EVT_OUTPUT_MISS, output_miss_count); }
@@ -2171,7 +2241,9 @@ void velvet_reverb_poll(void)
     DIAG_LOG_BLK(DIAG_EVT_REVERB_ISR_IN_BLOCK, diag_isr_cycles - i_blk_0);
 #endif
 
-    block_ready = 0;
+    /* Release the slot only now that its samples have been fully consumed, so
+     * the ISR cannot refill it underneath us. */
+    in_rd_seq = in_rd_seq + 1u;
 
     /* Background update — NOT inside the block timer but timed separately
      * so we can see how much CPU it eats between blocks. Whatever it costs
