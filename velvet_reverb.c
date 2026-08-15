@@ -1632,6 +1632,13 @@ static void update_morph_state(void)
 #define DB_WINDOW_TARGET   0.50f      /* ms */
 #define DB_DURATION_TARGET 0.01f      /* seconds */
 
+/* The same dead-bands expressed in the morph state's own units (samples at
+ * fs_reverb), so the convergence test below can be judged on the same scale as
+ * the change detector above. Keeping them consistent is the whole point: see the
+ * comment on the periodic refresh for what happened when they disagreed. */
+#define DB_WINDOW_SAMPLES   (DB_WINDOW_TARGET   * (float)REVERB_FS_HZ / 1000.0f)  /*  12 */
+#define DB_DURATION_SAMPLES (DB_DURATION_TARGET * (float)REVERB_FS_HZ)            /* 240 */
+
 static float last_t0_win_target = -1e9f, last_t1_win_target = -1e9f, last_t2_dur_target = -1e9f;
 static uint16_t effgains_settle_counter = 0;
 static uint16_t effgains_periodic_counter = 0;
@@ -1656,25 +1663,52 @@ static void background_eff_gains_update(void)
 
     if (changed) effgains_settle_counter = EFFGAINS_SETTLE_BLOCKS;
 
-    /* Slow periodic refresh — catches morph-state drift during long
-     * stationary periods so effGains don't fossilise out of sync. BUT only
-     * when the morph IIRs have NOT yet converged to their targets. Once idle
-     * and settled, the morph state == targets and a recompute reproduces the
-     * exact same effGains: pure wasted work that adds a ~67 ms-periodic
-     * compute spike (up to ~217 µs on the T2 stage) capable of pushing a
-     * block past its 667 µs deadline. A missed deadline repeats the previous
-     * output block → audible "bitcrush". So skip the refresh when converged. */
+    /* Slow periodic refresh — catches morph-state drift during long stationary
+     * periods so effGains don't fossilise out of sync. Skipped once the morph has
+     * settled, because a recompute would then reproduce the same gains: pure
+     * wasted work adding a ~67 ms-periodic spike (up to ~217 µs on T2) able to
+     * push a block past its 667 µs deadline.
+     *
+     * Two things here were wrong and produced an audible click every 67 ms.
+     *
+     * The settled test used an absolute 1.0 sample while the change detector above
+     * uses a dead-band worth 240 samples of t2w. Any target movement between those
+     * two was both too small to count as a change AND too large to count as
+     * settled, so it fell through the gap: no settle window was granted, yet the
+     * refresh fired every time. Pot jitter lands in that gap constantly. Both
+     * tests now use the same dead-bands, so anything too small to be a gesture is
+     * also too small to be worth refreshing for.
+     *
+     * And the refresh granted a single block, which recomputes ONE stage (the
+     * round-robin below) after 67 ms of drift — snapping that stage's tap gains
+     * across the whole accumulated gap in one step. That is exactly the "audible
+     * step artefact in the convolution output" this file's header warns about.
+     * Granting the full settle window instead lets the gains track the morph in
+     * ~20 small steps per stage, each well inside the 30 ms morph tau. It costs
+     * more only when a refresh is genuinely needed, which after the threshold fix
+     * means the morph really is far from its target. */
     if (++effgains_periodic_counter >= EFFGAINS_PERIODIC_BLOCKS) {
         effgains_periodic_counter = 0;
         if (effgains_settle_counter == 0) {
             const float t0w = reverb_t0_window_ms_target  * (float)REVERB_FS_HZ / 1000.0f;
             const float t1w = reverb_t1_window_ms_target  * (float)REVERB_FS_HZ / 1000.0f;
             const float t2w = reverb_t2_duration_s_target * (float)REVERB_FS_HZ;
-            int converged =
+#ifdef DIAG_LEGACY_EFFGAINS_REFRESH
+            /* The pre-fix policy, kept so test/host_test/effgains_step.c can A/B
+             * the change rather than take the reasoning on trust. Not built into
+             * any firmware target. */
+            int settled =
                 fabsf(t0w - t0_window_morph) < 1.0f &&
                 fabsf(t1w - t1_window_morph) < 1.0f &&
                 fabsf(t2w - t2_window_morph) < 1.0f;
-            if (!converged) effgains_settle_counter = 1;
+            if (!settled) effgains_settle_counter = 1;
+#else
+            int settled =
+                fabsf(t0w - t0_window_morph) < DB_WINDOW_SAMPLES &&
+                fabsf(t1w - t1_window_morph) < DB_WINDOW_SAMPLES &&
+                fabsf(t2w - t2_window_morph) < DB_DURATION_SAMPLES;
+            if (!settled) effgains_settle_counter = EFFGAINS_SETTLE_BLOCKS;
+#endif
         }
     }
 
