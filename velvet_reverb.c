@@ -126,10 +126,34 @@ __attribute__((always_inline)) static inline int32_t smlad(uint32_t a, uint32_t 
  * GCC knows this type can alias any other and won't optimize across it. */
 typedef uint32_t u32_alias __attribute__((may_alias));
 
-/* ==== Rings ==== */
-static int16_t t0_ring[T0_RING_SAMPLES] CCM_ATTR;
-static int16_t t1_ring[T1_RING_SAMPLES] CCM_ATTR;
+/* ==== Rings ====
+ *
+ * Both cascade rings carry a REVERB_BLOCK-sample guard region past the nominal
+ * end that mirrors samples [0, REVERB_BLOCK). Every tap reads a window of
+ * REVERB_BLOCK (T1) or REVERB_BLOCK+1 (T0, which pair-reads for its 2-tap
+ * interpolation) samples starting at an arbitrary masked position, so the last
+ * such window begins at RING_SAMPLES-1 and needs indices up to
+ * RING_SAMPLES+REVERB_BLOCK-1. With the mirror in place those reads are always
+ * contiguous and always in bounds, which buys three things: the per-tap wrap
+ * test and its segmented slow path disappear from the hot loop, the accumulator
+ * loops become a single fixed-count run the compiler can unroll, and a latent
+ * one-element overrun goes away — T1's pair loop advanced k by two up to an
+ * `until_wrap` that can be odd, reading one int16 past the segment end.
+ *
+ * The mirror is refreshed unconditionally once per block (see ring_guard_sync),
+ * which is ~16 halfword copies against the ~1000 tap reads it protects. */
+static int16_t t0_ring[T0_RING_SAMPLES + REVERB_BLOCK] CCM_ATTR;
+static int16_t t1_ring[T1_RING_SAMPLES + REVERB_BLOCK] CCM_ATTR;
 static int16_t * const t2_ring = (int16_t *)T2_RING_BASE;
+
+/* Mirror a ring's first REVERB_BLOCK samples into its guard region. Must run
+ * after the block write and before any tap reads that ring. */
+__attribute__((always_inline))
+static inline void ring_guard_sync(int16_t *ring, uint32_t nsamples)
+{
+    for (uint32_t k = 0; k < (uint32_t)REVERB_BLOCK; k++) ring[nsamples + k] = ring[k];
+}
+
 static uint32_t ring_write_idx = 0;
 /* Wrap modulus for ring_write_idx/block_write_idx (see do_input_write_t0). 2^23 is
  * a multiple of every ring size (T0=2^13, T1=2^14, T2=2^18) so masked positions are
@@ -646,6 +670,31 @@ static int32_t accT0[REVERB_BLOCK] CCM_ATTR;
 static int32_t accT1[REVERB_BLOCK] CCM_ATTR;
 static int32_t accL [REVERB_BLOCK] CCM_ATTR;
 static int32_t accR [REVERB_BLOCK] CCM_ATTR;
+
+/* Accumulator blocking.
+ *
+ * The natural way to write these convolutions puts the tap loop outermost and
+ * the sample loop inside, which means the whole accumulator array is loaded and
+ * stored once per tap. GCC cannot keep it in registers across the tap boundary
+ * because these accumulators are statics whose address escapes, so it emits a
+ * real load/qadd/store per sample per tap — eleven instructions for two MACs,
+ * four of them pure accumulator traffic.
+ *
+ * Interchanging the loops fixes it: hold REVERB_ACC_CHUNK accumulators in
+ * registers, sweep every tap into them, then store once. At 40 taps that turns
+ * roughly 1280 accumulator accesses per stage into 32.
+ *
+ * The interchange is exactly bit-preserving, which is what makes it safe to
+ * apply to a saturating accumulation. qadd_sat is not associative, so reordering
+ * the additions would be a genuine risk — but this does not reorder them. For any
+ * given output sample the taps are still summed in ascending tap order; all that
+ * changes is the order in which different output samples are visited. The IR
+ * harness confirms this byte for byte against the pre-optimisation baseline.
+ *
+ * Chunk of 4 is chosen to fit: four accumulators plus gain, base, source pointer
+ * and two sample pairs stay inside the register file without spilling, which is
+ * the whole point of the exercise. */
+#define REVERB_ACC_CHUNK 4
 
 /* ==== Output ring (jitter buffer) ====
  * poll() produces one output block per input block (avg rate matches the
@@ -1796,6 +1845,7 @@ static void do_input_write_t0(void)
 #endif
         t0_ring[wi & T0_RING_MASK] = soft_clip_int16(v);
     }
+    ring_guard_sync(t0_ring, T0_RING_SAMPLES);
     block_write_idx = ring_write_idx;
     ring_write_idx += REVERB_BLOCK;
     /* Keep the free-running index in float-exact range. block_write_idx is cast to
@@ -1874,26 +1924,12 @@ static inline void do_t0_phase_fast(void)
  * into the tap gain. Replaces the old two-pass scheme (2× ring reads + 2×
  * accT0 read-modify-write per tap). The internal SMLAD sum can't overflow:
  * |ring·ga + ring·gb| ≤ 32767·(ga+gb) = 32767·g ≤ 32767². */
-static void accumulate_t0_interp(uint32_t base, uint32_t gab)
-{
-    /* Point `src` at a contiguous (REVERB_BLOCK+1)-sample window. In the common
-     * case that window lies inside the ring without wrapping, so we read it
-     * directly (no copy). Only when it straddles the wrap do we gather it once
-     * into a small local buffer; either way the SMLAD loop below is identical. */
-    const int16_t *src;
-    int16_t w[REVERB_BLOCK + 1];
-    if (T0_RING_SAMPLES - base >= (uint32_t)REVERB_BLOCK + 1u) {
-        src = &t0_ring[base];
-    } else {
-        for (int k = 0; k <= REVERB_BLOCK; k++)
-            w[k] = t0_ring[(base + (uint32_t)k) & T0_RING_MASK];
-        src = w;
-    }
-    for (int k = 0; k < REVERB_BLOCK; k++) {
-        uint32_t wpair = *((const u32_alias *)(src + k));
-        accT0[k] = qadd_sat(accT0[k], smlad(wpair, gab, 0));
-    }
-}
+/* Per-tap read position and packed interpolation gains, computed once per block
+ * by pass 1 of do_t0_phase_mod and consumed by its chunked pass 2. These exist
+ * because the accumulator blocking puts the tap loop inside the chunk loop, and
+ * the float work that derives them must not be repeated per chunk. */
+static uint32_t t0_mod_base[MAX_T0_TAPS] CCM_ATTR;
+static uint32_t t0_mod_gab [MAX_T0_TAPS] CCM_ATTR;
 
 /* Modulated T0 convolution — each tap's read position is displaced by a
  * per-tap (golden-angle phase) LFO so the early-reflection cluster shimmers
@@ -1913,6 +1949,12 @@ static void do_t0_phase_mod(float depth)
     int tapEnd = t0TapCount;
     float ph0 = t0_tap_mod_phase;
     float sinP0 = sinf(ph0), cosP0 = cosf(ph0);
+
+    /* Pass 1 — per-tap float work, once per block. Compacting the active taps
+     * into a dense list here (rather than testing g == 0 inside pass 2) keeps the
+     * inner loop branchless while preserving both the skip and the tap ordering,
+     * and the ordering is what makes the saturating accumulation bit-exact. */
+    int n = 0;
     for (int t = 0; t < tapEnd; t++) {
         int32_t g = (int32_t)effGains_t0[t];
         if (g == 0) continue;
@@ -1924,9 +1966,31 @@ static void do_t0_phase_mod(float depth)
         int32_t ga   = (int32_t)((float)g * rf);    /* gain for older sample (ri_base-1) */
         int32_t gb   = g - ga;                       /* gain for ri_base (conserves g) */
         /* pack {ga (low half), gb (high half)} to pair with {ring[k], ring[k+1]} */
-        uint32_t gab = ((uint32_t)(uint16_t)gb << 16) | ((uint32_t)(uint16_t)ga & 0xFFFFu);
-        uint32_t base = (block_write_idx - (uint32_t)effOffT0[t] - (uint32_t)idel - 1u) & T0_RING_MASK;
-        accumulate_t0_interp(base, gab);
+        t0_mod_gab[n]  = ((uint32_t)(uint16_t)gb << 16) | ((uint32_t)(uint16_t)ga & 0xFFFFu);
+        t0_mod_base[n] = (block_write_idx - (uint32_t)effOffT0[t] - (uint32_t)idel - 1u) & T0_RING_MASK;
+        n++;
+    }
+
+    /* Pass 2 — chunked accumulation. Each SMLAD applies the 2-tap linear
+     * interpolation in one instruction: for output k it combines the packed pair
+     * {ring[base+k], ring[base+k+1]} with the packed gains {ga, gb}, i.e.
+     *   accT0[k] += ring[base+k]·ga + ring[base+k+1]·gb
+     * The internal sum cannot overflow: |ring·ga + ring·gb| <= 32767·(ga+gb)
+     * = 32767·g <= 32767². The guard region makes the (REVERB_BLOCK+1)-sample
+     * window contiguous for every base, so there is no wrap test and no gather. */
+    for (int c = 0; c < REVERB_BLOCK; c += REVERB_ACC_CHUNK) {
+        int32_t a0 = accT0[c], a1 = accT0[c+1], a2 = accT0[c+2], a3 = accT0[c+3];
+
+        for (int i = 0; i < n; i++) {
+            const uint32_t gab = t0_mod_gab[i];
+            const int16_t *src = &t0_ring[t0_mod_base[i] + (uint32_t)c];
+            a0 = qadd_sat(a0, smlad(*((const u32_alias *)(src + 0)), gab, 0));
+            a1 = qadd_sat(a1, smlad(*((const u32_alias *)(src + 1)), gab, 0));
+            a2 = qadd_sat(a2, smlad(*((const u32_alias *)(src + 2)), gab, 0));
+            a3 = qadd_sat(a3, smlad(*((const u32_alias *)(src + 3)), gab, 0));
+        }
+
+        accT0[c] = a0; accT0[c+1] = a1; accT0[c+2] = a2; accT0[c+3] = a3;
     }
 }
 
@@ -1958,9 +2022,45 @@ static void do_bridge_t0_to_t1(void)
         t1_ring[wi & T1_RING_MASK] = soft_saturate_q15(accT0[i]);
         accT1[i] = 0;
     }
+    ring_guard_sync(t1_ring, T1_RING_SAMPLES);
 }
 
+/* Per-tap window start, computed once per block. Same reason as T0's: with the
+ * tap loop inside the chunk loop, deriving the base per tap per chunk repeated
+ * the subtract and mask four times over — and cost a reload of block_write_idx
+ * from the stack each time, which was enough register pressure to push two of
+ * the four accumulators out to the stack as well. */
+static const int16_t *t1_tap_src[MAX_T1_TAPS] CCM_ATTR;
+
 static void do_t1_phase(void)
+{
+    const int tapEnd = t1TapCount;
+
+    for (int t = 0; t < tapEnd; t++)
+        t1_tap_src[t] = &t1_ring[(block_write_idx - (uint32_t)effOffT1[t]) & T1_RING_MASK];
+
+    for (int c = 0; c < REVERB_BLOCK; c += REVERB_ACC_CHUNK) {
+        int32_t a0 = accT1[c], a1 = accT1[c+1], a2 = accT1[c+2], a3 = accT1[c+3];
+
+        for (int t = 0; t < tapEnd; t++) {
+            const uint32_t gain = (uint32_t)(int32_t)effGains_t1[t];
+            /* Guard region makes this contiguous for every base — no wrap split,
+             * and no odd-length segment to run off the end of. */
+            const int16_t *src = t1_tap_src[t] + c;
+            uint32_t p0 = *((const u32_alias *)(src));
+            uint32_t p1 = *((const u32_alias *)(src + 2));
+            a0 = qadd_sat(a0, smulbb(p0, gain));
+            a1 = qadd_sat(a1, smultb(p0, gain));
+            a2 = qadd_sat(a2, smulbb(p1, gain));
+            a3 = qadd_sat(a3, smultb(p1, gain));
+        }
+
+        accT1[c] = a0; accT1[c+1] = a1; accT1[c+2] = a2; accT1[c+3] = a3;
+    }
+}
+
+#if 0 /* superseded by the chunked loop above; kept for reference */
+static void do_t1_phase_unchunked(void)
 {
     int tapEnd = t1TapCount;
     for (int t = 0; t < tapEnd; t++) {
@@ -1992,6 +2092,7 @@ static void do_t1_phase(void)
         }
     }
 }
+#endif /* superseded */
 
 static void do_bridge_t1_to_t2(void)
 {
