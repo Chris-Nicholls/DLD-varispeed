@@ -5,7 +5,8 @@
  * from the main loop in 16-sample blocks (= 32 codec samples, ~667 µs).
  *
  *   codec → push (avg 2:1 decimate) → pre-delay sustain engine (2 modulated,
- *           damped feedback delay lines A/B, shared shelves, input duck, mix)
+ *           damped feedback delay lines A/B read through allpass fractional
+ *           delays, shared shelves, input duck, mix)
  *             ↓ (feedforward into the cascade)
  *           T0 ring (CCM)
  *           T0 sparse conv  (+ optional per-tap Lexicon LFO on the readout)
@@ -60,6 +61,7 @@
 #endif
 #define TWO_PI_F  6.28318530717958647692f
 #define PI_F      3.14159265358979323846f
+#define PI_2_F    1.57079632679489661923f
 
 #ifdef VELVET_REVERB_HOST
 #include <limits.h>
@@ -524,6 +526,9 @@ static uint32_t predelay_wh = 0;            /* shared free-running write head */
 static float pre_mod_phase_a = 0.0f;
 static float pre_mod_phase_b = PI_F;        /* decorrelated phase */
 static float pre_hp_a = 0.0f, pre_hp_b = 0.0f;   /* per-line ~12 Hz DC block state */
+/* Per-line allpass fractional-delay state (see read_ring_allpass). */
+typedef struct { float prev_in, prev_out; } ApState;
+static ApState pre_ap_a, pre_ap_b;
 static float duck_env = 0.0f;
 static Biquad pre_low_shelf_a CCM_ATTR, pre_high_shelf_a CCM_ATTR;
 static Biquad pre_low_shelf_b CCM_ATTR, pre_high_shelf_b CCM_ATTR;
@@ -1221,6 +1226,8 @@ void velvet_reverb_init(void)
     predelay_wh = 0;
     pre_mod_phase_a = 0.0f; pre_mod_phase_b = PI_F;
     pre_hp_a = pre_hp_b = 0.0f;
+    pre_ap_a.prev_in = pre_ap_a.prev_out = 0.0f;
+    pre_ap_b.prev_in = pre_ap_b.prev_out = 0.0f;
     duck_env = 0.0f;
     pre_low_shelf_a.z1 = pre_low_shelf_a.z2 = 0.0f;
     pre_high_shelf_a.z1 = pre_high_shelf_a.z2 = 0.0f;
@@ -1688,10 +1695,13 @@ static void background_eff_gains_update(void)
     stage_round_robin = (stage_round_robin + 1) % 3;
 }
 
+
 /* ==== Phase handlers ==== */
 
 /* Linear-interpolated read of a float ring at a (possibly fractional, possibly
- * negative) position. Mirrors JS readRingInterp. */
+ * negative) position. Retained for the harness A/B
+ * (build with PREDELAY_INTERP_LINEAR); the pre-delay loop uses the allpass
+ * below, for the reason set out there. */
 __attribute__((always_inline)) static inline float read_ring_interp(const float *buf, uint32_t mask, float pos)
 {
     int32_t i = (int32_t)pos;
@@ -1702,10 +1712,74 @@ __attribute__((always_inline)) static inline float read_ring_interp(const float 
     return a + f * (b - a);
 }
 
-/* triangle/poly sine in [-π, π] — same Taylor form as JS fastSin, used for the
- * pre-delay line modulation (sub-Hz, so the corners are inaudible). */
+/* Fractional read via a 1st-order Thiran allpass, for the pre-delay feedback
+ * lines specifically.
+ *
+ * Linear interpolation is a lowpass — at a half-sample offset its gain is
+ * cos(ω/2), which is -3 dB at a quarter of the sample rate. Used once that is
+ * inaudible, but here it sits INSIDE a loop that content traverses every 4440
+ * samples, 5.4 times a second, so the loss compounds. Measured on the loop with
+ * the shelves removed (test/host_test/hf_decay.c): 0.65 dB per traversal at 4 kHz
+ * and 2.79 dB at 8 kHz, against nothing at all below 2 kHz. That is an 8 kHz RT60
+ * of 4 s under mids that ring effectively forever, and it is why the tails were
+ * mid-heavy with no shimmer. A 4-point cubic only softens it (0 dB at 4 kHz but
+ * still 1.08 dB at 8 kHz) and needs 4 SDRAM floats per read instead of 2.
+ *
+ * An allpass has unity magnitude at every frequency by construction, so it costs
+ * nothing per traversal no matter how many traversals there are, and it reads a
+ * single SDRAM float — less bus traffic than the linear read it replaces, which
+ * matters because SDRAM contention with the codec ISR is what ruled the cubic out.
+ * What it approximates is the group delay, not the magnitude; the error shows up
+ * as mild high-frequency dispersion, which in a reverb loop is diffusion.
+ *
+ * Conditioning: the sample is read 2 ahead of the target position and the allpass
+ * supplies a delay of d = 2 - frac, so d stays in (1, 2] and the coefficient
+ * a = (1-d)/(1+d) = (frac-1)/(3-frac) stays in [-1/3, 0). Bounded well away from
+ * the |a| = 1 stability edge, and — the reason for choosing a single expression
+ * over the usual branch that keeps d near 1 — continuous in frac. A branch at
+ * frac = 0.5 would step a from +1/3 to -1/5 while both sides agree on the
+ * position, which is a filter discontinuity, i.e. a click. The loop modulation
+ * moves frac by 0.00066 per sample (7.2 samples of swing at 0.35 Hz), so the
+ * coefficient drifts far too slowly for time-varying allpass artefacts. */
+__attribute__((always_inline)) static inline
+float read_ring_allpass(const float *buf, uint32_t mask, float pos, ApState *st)
+{
+    int32_t i = (int32_t)pos;
+    float f = pos - (float)i;
+    if (f < 0.0f) { f += 1.0f; i -= 1; }
+    float x = buf[((uint32_t)i + 2u) & mask];
+    float a = (f - 1.0f) / (3.0f - f);
+    float y = a * (x - st->prev_out) + st->prev_in;
+    st->prev_in = x; st->prev_out = y;
+    return y;
+}
+
+/* Pick the pre-delay read once, so the two lines can never diverge. */
+#ifdef PREDELAY_INTERP_LINEAR
+#define PREDELAY_READ(buf, pos, st)  read_ring_interp((buf), PRE_DELAY_LINE_MASK, (pos))
+#else
+#define PREDELAY_READ(buf, pos, st)  read_ring_allpass((buf), PRE_DELAY_LINE_MASK, (pos), (st))
+#endif
+
+/* poly sine on [-π, π], used for the pre-delay line modulation.
+ *
+ * The polynomial is a Taylor series about 0, so it is accurate near 0 and wrong
+ * at the ends: it returns ±0.524 at ±π where a true sine is 0. do_predelay folds
+ * its phase into (-π, π], so feeding the raw phase in stepped the returned value
+ * by 1.05 at every fold — which moved the read position of a delay line 7.55
+ * samples instantaneously (0.31 ms at 24 kHz), splicing it 0.7 times a second.
+ * That was audible as a distinct click, and it was invisible to every peak-based
+ * probe because a splice does not change the block's amplitude. See
+ * test/host_test/predelay_wrap.c, which measures the step at the wrap sample.
+ *
+ * Folding to [-π/2, π/2] via sin(x) = sin(π - x) keeps the argument in the range
+ * the series is good for, so the value is continuous across the fold (both sides
+ * approach 0) and stays within 0.005 of a true sine. The residual kink in the
+ * slope at ±π/2 is a slope change, not a step, at a sub-Hz rate. */
 __attribute__((always_inline)) static inline float fast_sin_pi(float x)
 {
+    if (x >  PI_2_F)      x =  PI_F - x;
+    else if (x < -PI_2_F) x = -PI_F - x;
     float x2 = x * x;
     return x * (1.0f + x2 * (-0.16666666f + x2 * 0.00833333f));
 }
@@ -1784,9 +1858,19 @@ static void do_predelay(void)
         /* line A */
         pre_mod_phase_a += modInc; if (pre_mod_phase_a >= TWO_PI_F) pre_mod_phase_a -= TWO_PI_F;
         float pa = pre_mod_phase_a; if (pa > PI_F) pa -= TWO_PI_F;
+        /* Reduce the write head modulo the line length BEFORE the float cast. The
+         * cast of predelay_wh itself is exact (it wraps below 2^24), but that is
+         * not what limits a fractional read: the subtraction's result carries the
+         * write head's magnitude, and float spacing there sets how finely the
+         * fractional offset can be represented at all. At 2^22 the spacing is half
+         * a sample, so for over half of every 350 s wrap cycle the smooth
+         * modulation sweep was being quantised into a staircase of half-sample
+         * jumps. Masking first keeps the magnitude under the line length, which
+         * holds the resolution at ~0.002 samples permanently. The masked index is
+         * unchanged, since the ring is indexed modulo the same length. */
+        float whf = (float)(predelay_wh & PRE_DELAY_LINE_MASK);
         float extraA = modDepth * (1.0f + fast_sin_pi(pa));
-        float rA = read_ring_interp(predelay_a, PRE_DELAY_LINE_MASK,
-                                    (float)predelay_wh - timeA - extraA);
+        float rA = PREDELAY_READ(predelay_a, whf - timeA - extraA, &pre_ap_a);
         rA = biquad_process(&pre_high_shelf_a, biquad_process(&pre_low_shelf_a, rA));
         pre_hp_a += pre_hp_coeff * (rA - pre_hp_a);
         float nodeA = px + fbEff * (rA - pre_hp_a);
@@ -1802,8 +1886,7 @@ static void do_predelay(void)
         pre_mod_phase_b += modInc; if (pre_mod_phase_b >= TWO_PI_F) pre_mod_phase_b -= TWO_PI_F;
         float pb = pre_mod_phase_b; if (pb > PI_F) pb -= TWO_PI_F;
         float extraB = modDepth * (1.0f + fast_sin_pi(pb));
-        float rB = read_ring_interp(predelay_b, PRE_DELAY_LINE_MASK,
-                                    (float)predelay_wh - timeB - extraB);
+        float rB = PREDELAY_READ(predelay_b, whf - timeB - extraB, &pre_ap_b);
         rB = biquad_process(&pre_high_shelf_b, biquad_process(&pre_low_shelf_b, rB));
         pre_hp_b += pre_hp_coeff * (rB - pre_hp_b);
         float nodeB = px + fbEff * (rB - pre_hp_b);
@@ -1819,6 +1902,7 @@ static void do_predelay(void)
         predelay_wh++;
         if (predelay_wh >= REVERB_IDX_WRAP) predelay_wh -= REVERB_IDX_WRAP;
     }
+
 }
 
 static void do_input_write_t0(void)
