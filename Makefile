@@ -34,6 +34,19 @@ BISECT_FLAGS = -DDIAG_BISECT_NO_T2SAT
 BUILDDIR     = build_bisect_t2sat
 endif
 
+# ---- Output limiter off ----------------------------------------------------
+# make NOLIM=1 flash   removes the output limiter entirely (not just its gain):
+# no look-ahead buffer, no peak scan, straight through to the int16 conversion as
+# before. A normal listenable firmware, for A/B-ing the limiter by ear. In the
+# harness this is the difference between 1.57 % of output samples clipping and
+# 0.000 %, which cost 2.3 dB of broadband hash and, at 0 dBFS in, 2.7 dB of
+# output RMS.
+NOLIM ?= 0
+ifeq ($(NOLIM),1)
+BISECT_FLAGS += -DDIAG_NO_LIMITER
+BUILDDIR      = build_nolim
+endif
+
 # ---- T2 DMA off ------------------------------------------------------------
 # NODMA=1 replaces the T2 SDRAM prefetch with plain CPU copies, with no
 # profiling and no FSK, so it is a normal listenable firmware. This is the single

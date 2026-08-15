@@ -753,6 +753,14 @@ static uint8_t  out_idx_R = 0;
 static float prev_out_L = 0.0f;   /* width-processed reverb-rate output (for upsample interp) */
 static float prev_out_R = 0.0f;
 
+/* Output limiter state. Two phases: one block being computed, one being emitted,
+ * which is what provides the look-ahead (see the limiter notes further down). */
+static float   lim_buf_L[2][REVERB_OUT_BLOCK] CCM_ATTR;
+static float   lim_buf_R[2][REVERB_OUT_BLOCK] CCM_ATTR;
+static uint8_t lim_phase = 0;
+static float   lim_gain = 1.0f;         /* gain at the last block boundary */
+static float   lim_gain_target = 1.0f;
+
 static int16_t dma_scratch[2][REVERB_BLOCK] __attribute__((aligned(4)));
 static uint8_t dma_buf_idx = 0;
 
@@ -1213,6 +1221,13 @@ void velvet_reverb_init(void)
         }
     }
     prev_out_L = 0; prev_out_R = 0;
+    for (int p = 0; p < 2; p++) {
+        for (int i = 0; i < REVERB_OUT_BLOCK; i++) {
+            lim_buf_L[p][i] = 0.0f; lim_buf_R[p][i] = 0.0f;
+        }
+    }
+    lim_phase = 0;
+    lim_gain = 1.0f; lim_gain_target = 1.0f;
     push_acc = 0; push_phase = 0;
     in_wr_seq = 0; in_rd_seq = 0;
     input_fill_idx = 0;
@@ -1318,15 +1333,17 @@ void velvet_reverb_init(void)
  * C1-continuous at the threshold (value and slope match the linear region) and
  * asymptotes to ±1.0. Replaces the old hard clip so overs round off musically
  * instead of clipping harshly. */
-static inline float soft_clip_unit(float x)
+static inline float soft_clip_knee(float x, float t)
 {
     float a = (x < 0.0f) ? -x : x;
-    if (a <= SOFT_KNEE_T) return x;
-    float k = 1.0f - SOFT_KNEE_T;
-    float e = a - SOFT_KNEE_T;
-    float y = SOFT_KNEE_T + k * e / (k + e);   /* -> 1.0, slope 1 at threshold */
+    if (a <= t) return x;
+    float k = 1.0f - t;
+    float e = a - t;
+    float y = t + k * e / (k + e);   /* -> 1.0, slope 1 at threshold */
     return (x < 0.0f) ? -y : y;
 }
+
+static inline float soft_clip_unit(float x) { return soft_clip_knee(x, SOFT_KNEE_T); }
 
 /* Q30 accumulator (Q15 sample × Q15 gain, summed) -> int16, soft-clipped at
  * full scale. 2^30 = full scale in the Q30 domain. Used at the stage bridges
@@ -1352,6 +1369,74 @@ static inline int16_t soft_clip_int16(float v)
 {
     return (int16_t)(soft_clip_unit(v * (1.0f / 32768.0f)) * 32767.0f);
 }
+
+/* ==== Output limiter ====
+ *
+ * The wet signal has about 7 dB more peak gain than the output can carry: the
+ * pre-delay feedback loop roughly doubles the peak of a sustained input and the
+ * stereo width adds a further 1.8 dB, so a full-scale input produces peaks near
+ * 2.2x full scale. Its RMS, though, sits 8-12 dB BELOW full scale — this is a
+ * crest-factor problem, not a level problem, and only 0.01-1.5 % of samples are
+ * involved. That distinction is what makes a limiter the right answer: turning
+ * the reverb (or its input) down scales peak and average together and just makes
+ * it quieter, whereas limiting takes the peaks down and leaves the level alone.
+ *
+ * Why it matters more than ordinary clipping would: the cascade runs at 24 kHz,
+ * so harmonics generated above 4 kHz land past Nyquist and fold back down as
+ * broadband hash. That reads as noise rather than as distortion, and it became
+ * audible once the allpass fractional delay let high frequencies sustain in the
+ * loop, giving the clipper HF-rich material to work on.
+ *
+ * Design. The gain is derived from the peak of the block being computed but
+ * applied to the PREVIOUS block, which buys a free block of look-ahead: the ramp
+ * finishes exactly as the block that demanded it starts, so the gain is already
+ * down when the peak arrives and there is no overshoot to distort. Costs one
+ * block (0.67 ms) of latency. Attack is therefore one block; release is eased so
+ * a single peak does not duck the tail audibly. The gain is stereo-linked, since
+ * independent channel gains would modulate the stereo image.
+ *
+ * Ceiling sits below the output knee so that in normal operation the knee is
+ * never reached and the output path is completely transparent — the knee is left
+ * in place only to absorb the small overshoot a biquad step response can add on
+ * top of the peak measured before it. */
+#define LIM_CEILING     0.95f    /* of full scale; peak is measured post-biquad  */
+#define SOFT_KNEE_OUT   0.97f    /* output-only knee; bridges keep SOFT_KNEE_T   */
+/* One-pole release at the 1500 Hz block rate. This is the whole trade: peaks in
+ * a dense reverb tail arrive roughly once per block, so a slow release never gets
+ * to recover between them and degenerates into a static gain cut — which is just
+ * turning the reverb down, the one outcome we are trying to avoid. Too fast and
+ * the gain itself modulates at audio rates and sprays sidebands. Swept in
+ * test/host_test/clip_hash.c against both RMS retained and hash produced. */
+/* 0.03 ~ 22 ms. Measured: at 0 dBFS input, 80 ms costs 3.3 dB of output RMS and
+ * 22 ms costs 2.7 dB, while going faster than this starts letting peaks through
+ * (the gain rises within the block being emitted) for very little further gain. */
+#ifndef LIM_RELEASE
+#define LIM_RELEASE     0.03f
+#endif
+
+static inline int16_t clip_out_int16(float v)
+{
+    return (int16_t)(soft_clip_knee(v * (1.0f / 32768.0f), SOFT_KNEE_OUT) * 32767.0f);
+}
+
+#ifdef VELVET_REVERB_HOST
+/* Same conversion, tallied. Used only at the final output write so the count is
+ * over output samples and not over every bridge as well. */
+static inline int16_t clip_out_counted(float v)
+{
+    float u = v * (1.0f / 32768.0f);
+    float a = u < 0.0f ? -u : u;
+    if (a > host_dbg_final_peak) host_dbg_final_peak = a;
+    host_dbg_final_n++;
+    host_dbg_final_sumsq += (double)u * (double)u;
+    if (a > SOFT_KNEE_OUT) host_dbg_final_knee++;
+    if (a >= 1.0f)         host_dbg_final_over++;
+    return clip_out_int16(v);
+}
+#define SOFT_CLIP_OUT clip_out_counted
+#else
+#define SOFT_CLIP_OUT clip_out_int16
+#endif
 
 /* ==== Per-block effGains recompute (ladder-driven) ====
  *
@@ -2385,6 +2470,31 @@ static void do_finalize(void)
     float pL = prev_out_L;
     float pR = prev_out_R;
 
+#ifdef DIAG_NO_LIMITER
+    /* Baseline for A/B, both sonic and for cycle counting: the pre-limiter output
+     * path, writing straight through with no look-ahead buffer, peak scan or gain. */
+    for (int i = 0; i < REVERB_BLOCK; i++) {
+        float rawL = (float)soft_saturate_q15(accL[i]) * REVERB_OUT_MAKEUP;
+        float rawR = (float)soft_saturate_q15(accR[i]) * REVERB_OUT_MAKEUP;
+        float m = 0.5f * (rawL + rawR);
+        float s = 0.5f * (rawL - rawR) * REVERB_STEREO_WIDTH;
+        float curL = m + s;
+        float curR = m - s;
+        float midL = (pL + curL) * 0.5f;
+        float midR = (pR + curR) * 0.5f;
+        wL[2 * i]     = SOFT_CLIP_OUT(biquad_process(&lpf_L, biquad_process(&hpf_L, midL)));
+        wR[2 * i]     = SOFT_CLIP_OUT(biquad_process(&lpf_R, biquad_process(&hpf_R, midR)));
+        wL[2 * i + 1] = SOFT_CLIP_OUT(biquad_process(&lpf_L, biquad_process(&hpf_L, curL)));
+        wR[2 * i + 1] = SOFT_CLIP_OUT(biquad_process(&lpf_R, biquad_process(&hpf_R, curR)));
+        pL = curL;
+        pR = curR;
+    }
+#else
+    /* Pass 1: compute this block into the look-ahead buffer, tracking its peak. */
+    float *nL = lim_buf_L[lim_phase];
+    float *nR = lim_buf_R[lim_phase];
+    float pk = 0.0f;
+
     for (int i = 0; i < REVERB_BLOCK; i++) {
         /* Mid-side stereo width on the reverb-rate stereo pair, applied before
          * the 2x upsample interp so the interpolated sample, the original
@@ -2407,17 +2517,52 @@ static void do_finalize(void)
 
         float midL = (pL + curL) * 0.5f;
         float midR = (pR + curR) * 0.5f;
-        wL[2 * i]     = soft_clip_int16(biquad_process(&lpf_L, biquad_process(&hpf_L, midL)));
-        wR[2 * i]     = soft_clip_int16(biquad_process(&lpf_R, biquad_process(&hpf_R, midR)));
-        wL[2 * i + 1] = soft_clip_int16(biquad_process(&lpf_L, biquad_process(&hpf_L, curL)));
-        wR[2 * i + 1] = soft_clip_int16(biquad_process(&lpf_R, biquad_process(&hpf_R, curR)));
+        float oL0 = biquad_process(&lpf_L, biquad_process(&hpf_L, midL));
+        float oR0 = biquad_process(&lpf_R, biquad_process(&hpf_R, midR));
+        float oL1 = biquad_process(&lpf_L, biquad_process(&hpf_L, curL));
+        float oR1 = biquad_process(&lpf_R, biquad_process(&hpf_R, curR));
+        nL[2 * i] = oL0; nR[2 * i] = oR0;
+        nL[2 * i + 1] = oL1; nR[2 * i + 1] = oR1;
+
+        /* Peak of the values actually stored, i.e. AFTER the biquads. Measuring
+         * before them left the ceiling guessing at how much a filter transient
+         * would add, and it added far more than assumed. Post-filter the ceiling
+         * is exact and needs no margin. */
+        float a0 = oL0 < 0.0f ? -oL0 : oL0;
+        float a1 = oR0 < 0.0f ? -oR0 : oR0;
+        float a2 = oL1 < 0.0f ? -oL1 : oL1;
+        float a3 = oR1 < 0.0f ? -oR1 : oR1;
+        if (a0 > pk) pk = a0;
+        if (a1 > pk) pk = a1;
+        if (a2 > pk) pk = a2;
+        if (a3 > pk) pk = a3;
 
         pL = curL;
         pR = curR;
     }
-    /* DIAGNOSTIC ABANDONED — click persisted with wR=wL mirror, so it's not
-     * inside the velvet reverb's stereo split. Revert leaves R using its
-     * own computed output (lpf_R/hpf_R/accR/T2-R-pass path). */
+
+    /* Gain for the block just computed. Attack is immediate at block granularity
+     * (the ramp below spends the previous block getting there); release eases. */
+    const float ceil_i16 = LIM_CEILING * 32768.0f;
+    float target = 1.0f;
+    if (pk > ceil_i16) target = ceil_i16 / pk;
+    if (target < lim_gain_target) lim_gain_target = target;
+    else lim_gain_target += LIM_RELEASE * (target - lim_gain_target);
+
+    /* Pass 2: emit the PREVIOUS block, ramping the gain across it so it arrives
+     * at the new target exactly as the block that demanded it begins. */
+    const float *cL = lim_buf_L[lim_phase ^ 1];
+    const float *cR = lim_buf_R[lim_phase ^ 1];
+    float g  = lim_gain;
+    float dg = (lim_gain_target - lim_gain) * (1.0f / (float)REVERB_OUT_BLOCK);
+    for (int k = 0; k < REVERB_OUT_BLOCK; k++) {
+        g += dg;
+        wL[k] = SOFT_CLIP_OUT(cL[k] * g);
+        wR[k] = SOFT_CLIP_OUT(cR[k] * g);
+    }
+    lim_gain  = lim_gain_target;
+    lim_phase ^= 1;
+#endif /* DIAG_NO_LIMITER */
     prev_out_L = pL;
     prev_out_R = pR;
 
