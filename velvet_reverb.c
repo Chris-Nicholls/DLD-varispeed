@@ -248,6 +248,21 @@ float reverb_fb_mod_depth      = 0.01f;   /* fixed: JS feedbackModDepth */
 float reverb_fb_mod_rate       = 0.35f;   /* fixed: JS feedbackModRate */
 float reverb_duck_amount       = 1.0f;    /* fixed: JS delayDuckAmount */
 float reverb_duck_release_s    = 2.0f;    /* fixed: JS delayDuckRelease */
+/* Duck release, expressed in LOOP TRAVERSALS rather than seconds.
+ *
+ * The duck attenuates whatever passes the pre-delay write node, and buffer
+ * content passes that node once per loop period — so the loop length, not an
+ * absolute time, is the natural unit. At 1.0 everything already circulating is
+ * attenuated exactly once and the duck is then out of the way, which is what
+ * makes an arriving sound overwrite the buffer rather than pile onto it.
+ * Beyond ~1.5 the duck is still engaged while the NEW sound is recirculating,
+ * so it starts erasing the very thing it just wrote: measured at -6 dBFS,
+ * going 1x -> 2x buys 1.4 dB more erasure of the old sound but costs 1.5 s of
+ * the new sound's tail, and by 3x both are worse.
+ *
+ * Deriving this from the line lengths (rather than the old fixed 2.0 s) also
+ * means it keeps tracking if the pre-delay times are ever changed. */
+float reverb_duck_release_loops = 1.0f;   /* fixed */
 
 /* T0 per-tap Lexicon LFO (early-reflection smearer; replaces recirc mod).
  * Fixed defaults from JS paramT1TapMod* (JS T1 → C T0). */
@@ -1818,8 +1833,15 @@ static void do_predelay(void)
 
     float duckAmount = reverb_duck_amount;
     if (duckAmount < 0.0f) duckAmount = 0.0f; else if (duckAmount > 1.0f) duckAmount = 1.0f;
-    float duckRelSec = reverb_duck_release_s; if (duckRelSec < 0.01f) duckRelSec = 0.01f;
-    float duckRelCoef = 1.0f - expf(-1.0f / (duckRelSec * (float)REVERB_FS_HZ));
+    /* Release tracks the loop length. timeA/timeB are the current (morphed,
+     * clamped) line lengths in samples, so the release is already in samples
+     * and needs no conversion. The LONGER line sets it, so both lines get at
+     * least one full traversal. */
+    float loopSamples = (timeA > timeB) ? timeA : timeB;
+    float duckRelSamples = reverb_duck_release_loops * loopSamples;
+    const float duckRelMin = 0.01f * (float)REVERB_FS_HZ;
+    if (!(duckRelSamples >= duckRelMin)) duckRelSamples = duckRelMin;
+    float duckRelCoef = 1.0f - expf(-1.0f / duckRelSamples);
 
     /* Shared shelf coeffs — recompute (for both lines) only on change. */
     if (reverb_fb_low_shelf_hz != last_fb_ls_hz || reverb_fb_low_shelf_db != last_fb_ls_db) {

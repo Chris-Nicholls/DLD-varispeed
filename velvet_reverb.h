@@ -190,7 +190,7 @@ extern float reverb_fb_high_shelf_db;
 extern float reverb_fb_mod_depth;        /* 0..1 (× PRE_MOD_MAX_SAMPLES) */
 extern float reverb_fb_mod_rate;         /* Hz */
 extern float reverb_duck_amount;         /* 0..1 max feedback reduction */
-extern float reverb_duck_release_s;      /* seconds */
+extern float reverb_duck_release_loops;  /* loop traversals, not seconds */
 
 /* T0 (early-reflection) per-tap Lexicon LFO — golden-angle decorrelated. */
 extern float reverb_t0_tap_mod_depth;    /* 0..1 (× ~5 ms swing) */
