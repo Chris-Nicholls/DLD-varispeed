@@ -93,6 +93,12 @@ float read_speed[NUM_CHAN] = {1.0f, 1.0f};
 float target_read_speed[NUM_CHAN] = {1.0f, 1.0f};
 uint32_t target_read_addr[NUM_CHAN];
 
+/* Deadband, in samples, inside which the read head counts as "arrived" and
+ * read_speed snaps back to exactly 1x. Must be at least one block (sz/2)
+ * wide, otherwise a 2x approach — which closes one block per block — can step
+ * straight over the band and hunt forever. */
+#define VARISPEED_DEADBAND_SAMPLES  (codec_BUFF_LEN / 4)
+
 float lpf_coef;
 int32_t min_vol;
 float mainin_lpf[2]={0.0,0.0}, auxin_lpf[2]={0.0,0.0};
@@ -208,6 +214,47 @@ uint32_t calculate_read_addr(uint8_t channel, uint32_t new_divmult_time){
 
 	t_read_addr = offset_samples(channel, write_addr[channel], new_divmult_time, 1-mode[channel][REV]);
 	return (t_read_addr);
+}
+
+
+/*
+ * varispeed_distance_samples()
+ *
+ * Signed delay-time error for the varispeed catch-up controller: how far the
+ * read head is from where divmult_time says it should be, measured in samples
+ * along the read head's own direction of travel. Positive means the read head
+ * is behind and has to speed up; negative means it is ahead and has to slow
+ * down.
+ *
+ * The ideal position is re-derived from write_addr on every call rather than
+ * carried in a free-running counter. write_addr already advances at exactly 1x
+ * for as long as we are recording, so this stays correct across events that
+ * displace either head (reverse swap, entering/leaving INF, the end of a read
+ * crossfade) — none of which a free-running counter can see, which is how the
+ * read head used to end up chasing a stale target most of the way around the
+ * buffer.
+ */
+static int32_t varispeed_distance_samples(uint8_t channel)
+{
+	const int32_t ring = (int32_t)loop_size[channel];
+
+	target_read_addr[channel] = calculate_read_addr(channel, divmult_time[channel]);
+
+	int32_t distance = (int32_t)target_read_addr[channel] - (int32_t)read_addr[channel];
+
+	/* Take the short way around the ring. The ring is loop_size, not
+	 * LOOP_SIZE — they differ by REVERB_SDRAM_RESERVE (~6.8 s), which is
+	 * exactly the bogus error a LOOP_SIZE correction used to invent whenever
+	 * the two heads straddled the wrap point. */
+	if (distance > (ring / 2))
+		distance -= ring;
+	else if (distance < -(ring / 2))
+		distance += ring;
+
+	if (mode[channel][REV])
+		distance = -distance;
+
+	return (distance / (int32_t)SAMPLESIZE);
 }
 
 void swap_read_write(uint8_t channel){
@@ -353,9 +400,11 @@ void set_divmult_time(uint8_t channel){
 
 	//t_divmult_time = t_divmult_time & 0xFFFFFFFC; //force it to be a multiple of 4
 
-	// Check for valid divmult time range
-	if (t_divmult_time > LOOP_SIZE/SAMPLESIZE)
-		t_divmult_time = LOOP_SIZE/SAMPLESIZE;
+	// Check for valid divmult time range. Cap against the channel's own ring
+	// (loop_size, which the reverb shortens) — a divmult longer than the ring
+	// wraps past itself and reads as a much shorter delay.
+	if (t_divmult_time > loop_size[channel]/SAMPLESIZE)
+		t_divmult_time = loop_size[channel]/SAMPLESIZE;
 
 	if (mode[channel][INF] != INF_OFF)
 	{
@@ -390,46 +439,11 @@ void set_divmult_time(uint8_t channel){
 	}
 	else
 	{
-		// INF_OFF mode: use varispeed catch-up instead of crossfade
+		// INF_OFF mode: the read head varispeeds to the new delay time instead
+		// of crossfading. Nothing to latch here — the catch-up controller in
+		// process_audio_block_codec re-measures the error against write_addr
+		// every block, so it picks the new divmult_time up on its own.
 		divmult_time[channel] = t_divmult_time;
-		
-		// Calculate where read head should be
-		target_read_addr[channel] = calculate_read_addr(channel, divmult_time[channel]);
-		
-		// Calculate signed distance from current to target
-		int32_t distance = (int32_t)target_read_addr[channel] - (int32_t)read_addr[channel];
-		
-		// Handle wraparound
-		int32_t half_loop = (int32_t)(LOOP_SIZE / 2);
-		if (distance > half_loop)
-			distance -= LOOP_SIZE;
-		else if (distance < -half_loop)
-			distance += LOOP_SIZE;
-		
-		// Flip sign for reverse mode
-		if (mode[channel][REV])
-			distance = -distance;
-		
-		// Convert to samples
-		int32_t distance_samples = distance / SAMPLESIZE;
-		
-		// Set target speed based on distance.
-		//
-		// The trigger threshold MUST match the ISR snap deadband
-		// (buffer_samples = sz/2 = codec_BUFF_LEN/4). The ISR snaps read_speed
-		// back to 1x whenever |distance| <= that deadband, which leaves a
-		// residual offset of up to deadband samples after every settle. If this
-		// trigger threshold were smaller than the deadband, that harmless
-		// residual would re-trigger catch-up every time set_divmult_time runs
-		// (e.g. on TIME-pot smoothing noise), producing spurious varispeed.
-		const int32_t catchup_deadband = codec_BUFF_LEN / 4;
-		if (distance_samples > catchup_deadband) {
-			target_read_speed[channel] = 2.0f;  // Speed up to catch up
-		} else if (distance_samples < -catchup_deadband) {
-			target_read_speed[channel] = 0.5f;  // Slow down
-		} else {
-			target_read_speed[channel] = 1.0f;  // Close enough
-		}
 	}
 
 }
@@ -725,37 +739,44 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	uint32_t _rd_t0 = DWT->CYCCNT;
 #endif
 	if (mode[channel][INF] == INF_OFF) {
-		// Calculate distance to target
-		int32_t distance = (int32_t)target_read_addr[channel] - (int32_t)read_addr[channel];
-		int32_t half_loop = (int32_t)(LOOP_SIZE / 2);
-		if (distance > half_loop) distance -= LOOP_SIZE;
-		else if (distance < -half_loop) distance += LOOP_SIZE;
-		if (mode[channel][REV]) distance = -distance;
-		int32_t distance_samples = distance / SAMPLESIZE;
-		
-		// If within one buffer of target, snap to normal speed
-		// Otherwise, slew toward target speed (2.0 or 0.5)
-		int32_t buffer_samples = sz / 2;
-		if (distance_samples >= -buffer_samples && distance_samples <= buffer_samples) {
-			// Within one buffer - snap to normal speed and zero fractional
-			// position so memory_read_varispeed's 1x fast path fires (single
-			// SDRAM read per sample instead of two for interpolation).
+		if (read_fade_pos[channel] > 0.0f) {
+			// A read crossfade is in flight (reverse swap, or the hand-off out
+			// of INF). Both heads are deliberately in transit, so the error
+			// against write_addr is meaningless until the fade lands — and
+			// holding 1x keeps rd_buff and rd_buff_dest sample-aligned so they
+			// can actually be mixed. Catch-up resumes on the block after
+			// increment_read_fade drops read_addr on its destination.
+			target_read_speed[channel] = 1.0f;
 			read_speed[channel] = 1.0f;
 			fractional_read_pos[channel] = 0.0f;
 		} else {
-			// Far from target - slew toward target speed
-			float slew = param[channel][VARISPEED_INERTIA];
-			if (read_speed[channel] < target_read_speed[channel]) {
-				read_speed[channel] += slew;
-				if (read_speed[channel] > target_read_speed[channel])
-					read_speed[channel] = target_read_speed[channel];
-			} else if (read_speed[channel] > target_read_speed[channel]) {
-				read_speed[channel] -= slew;
-				if (read_speed[channel] < target_read_speed[channel])
-					read_speed[channel] = target_read_speed[channel];
+			int32_t distance_samples = varispeed_distance_samples(channel);
+
+			if (distance_samples >= -VARISPEED_DEADBAND_SAMPLES && distance_samples <= VARISPEED_DEADBAND_SAMPLES) {
+				// Arrived: snap to normal speed and zero the fractional
+				// position so memory_read_varispeed's 1x fast path fires
+				// (single SDRAM read per sample instead of two for interp).
+				target_read_speed[channel] = 1.0f;
+				read_speed[channel] = 1.0f;
+				fractional_read_pos[channel] = 0.0f;
+			} else {
+				// Behind the target: speed up. Ahead of it: slow down. Then
+				// slew toward that speed at the configured inertia.
+				target_read_speed[channel] = (distance_samples > 0) ? 2.0f : 0.5f;
+
+				float slew = param[channel][VARISPEED_INERTIA];
+				if (read_speed[channel] < target_read_speed[channel]) {
+					read_speed[channel] += slew;
+					if (read_speed[channel] > target_read_speed[channel])
+						read_speed[channel] = target_read_speed[channel];
+				} else if (read_speed[channel] > target_read_speed[channel]) {
+					read_speed[channel] -= slew;
+					if (read_speed[channel] < target_read_speed[channel])
+						read_speed[channel] = target_read_speed[channel];
+				}
 			}
 		}
-		
+
 		crossed_start_fade_addr = memory_read_varispeed(read_addr, &fractional_read_pos[channel], channel, rd_buff, sz/2, read_speed[channel], start_fade_addr, doing_reverse_fade[channel]);
 	} else {
 		// Freeze modes: use original memory_read
@@ -806,8 +827,12 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 	}
 
-	// Read crossfade destination buffer (only needed for freeze modes, not varispeed)
-	if (mode[channel][INF] != INF_OFF) {
+	// Read crossfade destination buffer. Needed for the freeze modes, and in
+	// delay mode whenever a read fade is in flight — reversing (swap_read_write)
+	// and the hand-off out of INF both set one up, and without the destination
+	// buffer the fade never happens: read_addr just jumps to fade_dest_read_addr
+	// when the fade "completes".
+	if (mode[channel][INF] != INF_OFF || read_fade_pos[channel] > 0.0f) {
 		memory_read(fade_dest_read_addr, channel, rd_buff_dest, sz/2, 0, 0 /* + mode[channel][CONTINUOUS_REVERSE]*/);
 	}
 
@@ -899,11 +924,11 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 
 
 		// Read from the loop and save this value so we can output it to the Delay Out jack
-		if (mode[channel][INF] == INF_OFF) {
-			// Varispeed mode: use interpolated samples directly
+		if (mode[channel][INF] == INF_OFF && read_fade_pos[channel] <= 0.0f) {
+			// Varispeed mode, not fading: use interpolated samples directly
 			rd = rd_buff[i];
 		} else {
-			// Freeze modes: crossfade between buffers
+			// Crossfade between the current and destination read heads
 			t = (uint16_t)(4095.0f * read_fade_pos[channel]);
 			asm("usat %[dst], #12, %[src]" : [dst] "=r" (t) : [src] "r" (t));
 			rd = ((float)rd_buff[i] * epp_lut[t]) + ((float)rd_buff_dest[i] * epp_lut[4095-t]);

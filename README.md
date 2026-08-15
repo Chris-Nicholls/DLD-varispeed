@@ -3,6 +3,35 @@
 
 Firmware for the Dual Looping Delay, a Eurorack-format module from 4ms Company.
 
+---
+
+## Modified Firmware: Varispeed Catch-up Mode
+
+This firmware modifies the delay time behavior. Instead of crossfading when delay time changes, the read head moves at variable speed (up to +/- one octave) to catch up to the new position, introducing pitch changes with inertia.
+
+### Normal Mode Behavior
+
+When delay time changes (via Time knob, CV, or switch), the read head accelerates or decelerates to reach the new delay time position:
+
+- Read speed varies between 0.5x (one octave down) and 2.0x (one octave up)
+- Inertia controls how quickly the speed changes
+- When close to the target, the speed smoothly returns to 1.0x
+- Landing speed is calculated to hit the target exactly within one buffer
+
+### Setting Inertia
+
+Hold the Ping button and turn a Time knob to set varispeed inertia:
+
+- Left Time knob sets Channel A inertia
+- Right Time knob sets Channel B inertia
+- Knob at minimum: ~10ms to reach target speed (fast, subtle pitch changes)
+- Knob at maximum: ~2000ms to reach target speed (slow, dramatic pitch sweeps)
+- Default: ~80ms
+
+Inertia is saved to flash and persists across power cycles.
+
+---
+
 The DLD is a two-channel, clock-syncable, high fidelity audio looping delay, with a maximum loop period of 2 minutes 54 seconds per channel at 48kHz, 16-bit (about 6 minutes maximum time), and half the time at 48kHz, 24-bit.
 
 The DLD would make a nice platform for other audio projects, the hardware contains:
