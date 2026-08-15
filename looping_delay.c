@@ -652,6 +652,12 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	static uint8_t auto_muting_aux_state[NUM_CHAN]={0,0};
 	static float auto_muting_aux_fade[NUM_CHAN]={0,0};
 
+	/* Channel B's per-sample contribution to the mono reverb input, handed
+	 * across to channel A's ISR, which is the one that pushes into the reverb.
+	 * Sized to the largest block this function is ever called with
+	 * (codec_BUFF_LEN/4; the loop below runs sz/2 = 16 iterations today). */
+	static int16_t chB_reverb_contrib[codec_BUFF_LEN/4]={0};
+
 	/* (Snapshot removed — reverted to direct reads from volatile DMA buffer
 	 * to match HEAD behaviour while we hunt the input-leak bug.) */
 
@@ -949,13 +955,18 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		regen        = (rd     * regen_q15) >> 15;
 		mainin_atten = (mainin * level_q15) >> 15;
 
-		if (mode[channel][SEND_RETURN_BEFORE_LOOP]) {
-			wr     = auxin;
-			auxout = regen + mainin_atten;
-		} else {
-			wr     = regen + mainin_atten + auxin;
-			auxout = rd;
-		}
+		/* Send/Return is an insert between the DELAY and the REVERB. (It used
+		 * to be an insert in the delay feedback loop, selected by
+		 * SEND_RETURN_BEFORE_LOOP; that routing is gone.)
+		 *
+		 * SEND carries the delay engine output only — no dry — so an external
+		 * processor sees just the repeats. RETURN is picked up further down
+		 * and routed into the reverb input; it deliberately never reaches the
+		 * loop write or the dry path, so whatever is patched in colours the
+		 * reverb without feeding back into the delay or leaking into the dry
+		 * output. */
+		wr     = regen + mainin_atten;
+		auxout = rd;
 
 		/* DC blocker as a 1-pole IIR in Q23.8 fixed point.
 		 *   state += ((wr << 8) - state) >> 12         alpha ≈ 1/4096
@@ -990,12 +1001,18 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (mix) : [src] "r" (mix));
 
 #ifdef REVERB_ENABLE
-		/* --- Reverb: send-style routing ---
-		 * Right MIX scales the audio FED INTO the reverb (push_sample on
-		 * ch0 only — reverb input is mono). The reverb's stereo output is
-		 * then summed unscaled into the per-channel mix. So the right MIX
-		 * controls how hard the reverb is driven; the tail you hear scales
-		 * with that drive, but the output mix is never silenced.
+		/* --- Reverb: fed by a mono sum of both channels, plus the RETURNs ---
+		 * Right MIX scales the audio FED INTO the reverb. The reverb's stereo
+		 * output is then summed unscaled into the per-channel mix. So the
+		 * right MIX controls how hard the reverb is driven; the tail you hear
+		 * scales with that drive, but the output mix is never silenced.
+		 *
+		 * Each channel contributes its delay mix plus its RETURN jack. The
+		 * return is SUMMED with the internal feed rather than replacing it:
+		 * these jacks have no plug detection and no hardware normalling, so a
+		 * replacing insert would silence the reverb whenever nothing is
+		 * patched. Scaling the sum by the right MIX keeps that pot's meaning
+		 * intact — it still sets reverb drive, for the returned signal too.
 		 *
 		 * Diagnostic (reverb send = 0): clicks disappear. So the click is
 		 * IN the reverb path — the reverb is fed `mix` here, so any step in
@@ -1004,13 +1021,34 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		 * click, even though the same step is inaudible in the dry path. */
 		{
 			int16_t rev_s;
+			/* This channel's contribution to the mono reverb input. */
+			int32_t rev_contrib = mix + auxin;
+			if (SAMPLESIZE==2)
+				asm("ssat %[dst], #16, %[src]" : [dst] "=r" (rev_contrib) : [src] "r" (rev_contrib));
+
 			if (channel == 0) {
-				int32_t to_reverb = (mix * send_q15) >> 15;
+				/* Mono-sum both channels, averaged so correlated material
+				 * keeps the level the reverb saw when it was fed channel A
+				 * alone.
+				 *
+				 * Channel B's half is handed over from its own ISR. The two
+				 * share an NVIC preemption priority, so neither can interrupt
+				 * the other and the buffer can never be read half-written.
+				 * Which one runs first is not guaranteed though: they are
+				 * separate DMA interrupts, and the sub-priority tie-break
+				 * (A = 0, B = 1) only decides the order when both happen to
+				 * pend on the same cycle. So B's contribution is either from
+				 * this block or the previous one — at most 16 samples,
+				 * ~0.33 ms, of skew on one half of a mono send into a diffuse
+				 * reverb, which is well below audibility either way. */
+				int32_t to_reverb = ((rev_contrib + (int32_t)chB_reverb_contrib[i]) >> 1);
+				to_reverb = (to_reverb * send_q15) >> 15;
 				if (SAMPLESIZE==2)
 					asm("ssat %[dst], #16, %[src]" : [dst] "=r" (to_reverb) : [src] "r" (to_reverb));
 				velvet_reverb_push_sample((int16_t)to_reverb);
 				rev_s = velvet_reverb_out_left();
 			} else {
+				chB_reverb_contrib[i] = (int16_t)rev_contrib;
 				rev_s = velvet_reverb_out_right();
 			}
 			/* Fade the dry+delay path out over the top 10% of the right MIX

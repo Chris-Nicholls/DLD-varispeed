@@ -424,32 +424,23 @@ void update_system_settings(void)
 
 	//
 	// Switches: Center | Up
-	// Set Send/Return Before Loop
+	// (was: Set Send/Return Before Loop)
 	//
+	// Send/Return is now a fixed insert between the delay and the reverb
+	// (see the routing comment in process_audio_block_codec), so there is no
+	// longer anything to toggle here. The menu position still swallows the REV
+	// buttons so they don't fall through to changing playback direction while
+	// the switches are in this position.
+	//
+	// SEND_RETURN_BEFORE_LOOP itself is deliberately left in the mode[] enum
+	// and in flash_user.c: removing it would shift every later enum value and
+	// silently re-map existing users' saved settings.
 
 	if (switch1==SWITCH_CENTER && switch2==SWITCH_UP)
 	{
 		disable_mode_changes=1;
-
-		if (flag_rev_change[0])
-		{
-			if (mode[0][SEND_RETURN_BEFORE_LOOP])
-				mode[0][SEND_RETURN_BEFORE_LOOP] = 0;
-			else
-				mode[0][SEND_RETURN_BEFORE_LOOP] = 1;
-
-			flag_rev_change[0]=0;
-		}
-
-		if (flag_rev_change[1])
-		{
-			if (mode[1][SEND_RETURN_BEFORE_LOOP])
-				mode[1][SEND_RETURN_BEFORE_LOOP] = 0;
-			else
-				mode[1][SEND_RETURN_BEFORE_LOOP] = 1;
-
-			flag_rev_change[1]=0;
-		}
+		flag_rev_change[0]=0;
+		flag_rev_change[1]=0;
 	}
 }
 
@@ -582,19 +573,11 @@ void update_system_settings_button_leds(void)
 	}
 	else if (global_mode[SYSTEM_SETTINGS] && switch1==SWITCH_CENTER && switch2==SWITCH_UP)
 	{
-		// Display Send/Return Before Loop settings
-
-		if (mode[0][SEND_RETURN_BEFORE_LOOP])
-			LED_REV1_ON;
-		else
-			LED_REV1_OFF;
-
-		if (mode[1][SEND_RETURN_BEFORE_LOOP])
-			LED_REV2_ON;
-		else
-			LED_REV2_OFF;
-
-		// INF LEDs are not used in this menu
+		// Was the Send/Return Before Loop menu; that setting is retired now
+		// that Send/Return is a fixed delay->reverb insert. Nothing to show,
+		// so keep all four LEDs dark rather than leaving stale state lit.
+		LED_REV1_OFF;
+		LED_REV2_OFF;
 		LED_INF1_OFF;
 		LED_INF2_OFF;
 	}
