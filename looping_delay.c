@@ -46,6 +46,7 @@ uint32_t loop_size[NUM_CHAN];
 #include "compressor.h"
 #include "leds.h"
 #include "dig_pins.h"
+#include "codec_CS4271.h"
 
 extern const float epp_lut[4096];
 extern float param[NUM_CHAN][NUM_PARAMS];
@@ -90,18 +91,94 @@ uint8_t doing_reverse_fade[NUM_CHAN] = {0,0};
 // Varispeed state
 float fractional_read_pos[NUM_CHAN] = {0.0f, 0.0f};
 float read_speed[NUM_CHAN] = {1.0f, 1.0f};
-float target_read_speed[NUM_CHAN] = {1.0f, 1.0f};
 uint32_t target_read_addr[NUM_CHAN];
 
-/* Deadband, in samples, inside which the read head counts as "arrived" and
- * read_speed snaps back to exactly 1x. Must be at least one block (sz/2)
- * wide, otherwise a 2x approach — which closes one block per block — can step
- * straight over the band and hunt forever. */
-#define VARISPEED_DEADBAND_SAMPLES  (codec_BUFF_LEN / 4)
+/* Varispeed glide state. See update_read_speed(). */
+enum VarispeedStates {
+	VS_SETTLED,		// at the target, or nudging towards it
+	VS_WAITING,		// a big change is queued for the next clock tick
+	VS_GLIDING,		// moving at exactly 2x or 0.5x
+	VS_CROSSFADE	// glide used up its budget: crossfade the rest of the way
+};
+static uint8_t vs_state[NUM_CHAN] = {VS_SETTLED, VS_SETTLED};
+
+/* How much more delay-time change, in samples, the current glide may cover
+ * before handing over to a crossfade. */
+static float glide_budget[NUM_CHAN] = {0.0f, 0.0f};
+
+/* Delay-time errors up to this size are nudged out with an inaudible speed
+ * change, not a glide. They are what clock jitter, and the small drift of a
+ * slowly averaged ping, produce. A real TIME change is a jump between clock
+ * divisions, which is always far bigger than this. */
+#define VARISPEED_NUDGE_MAX_SAMPLES  240		/* 5 ms */
+#define VARISPEED_NUDGE_MAX_FRAC     32		/* ...or 1/32 of the delay time, whichever is bigger */
+
+/* Largest speed change a nudge uses: 0.3%, about 5 cents. */
+#define VARISPEED_NUDGE_RATE         0.003f
+
+/* Within this distance (in samples) of the target, the read head is placed
+ * exactly on it. Must be more than the smallest nudge memory_read_varispeed
+ * will actually move for: speeds within 0.001 of 1x take its 1x fast path,
+ * which on a 16-sample block ignores anything under 0.016 samples. */
+#define VARISPEED_ARRIVED            0.02f
+
+/* A glide covers at most this many clock periods of delay-time change: 2
+ * periods at 0.5x, or 1 at 2x. Anything left over is crossfaded. Without a
+ * limit, a big jump such as the time switch's +16 would take 32 clock periods
+ * at 0.5x, because lengthening a delay by N samples takes at least N samples
+ * whatever the speed. */
+#define VARISPEED_GLIDE_MAX_PERIODS  1
+
+/* Send/Return insert in the delay loop.
+ *
+ * The SEND jack carries the delay buffer read. Right of centre on the MIX
+ * pot, the RETURN jack stands in for that read: it feeds both the regen
+ * path and the wet output. Left of centre, the return is bypassed.
+ *
+ * A trip out of SEND and back in RETURN costs SEND_RETURN_LATENCY_SAMPLES:
+ * two DMA half-buffers (the block written now plays next block, and is
+ * captured and handed to us the block after that) plus the CS4271 DAC and ADC
+ * group delays. To keep repeat timing the same, the read head runs that
+ * many samples closer to the write head. The left-of-centre path then puts
+ * the read through an internal line of the same length, which stands in for
+ * the cable. So the two routings stay time-aligned. With SEND patched to
+ * RETURN at unity gain, both sides of the knob sound the same, and crossing
+ * 12 o'clock never moves the read head.
+ *
+ * The block part is exact. The codec part is taken from the datasheet and
+ * should be confirmed on hardware (patch SEND->RETURN, ping a short delay and
+ * compare the repeat spacing on either side of centre). */
+#define CODEC_DAC_GROUP_DELAY        9
+#define CODEC_ADC_GROUP_DELAY        12
+#define SEND_RETURN_LATENCY_SAMPLES  (2 * (codec_BUFF_LEN / 8) + CODEC_DAC_GROUP_DELAY + CODEC_ADC_GROUP_DELAY)
+
+/* Below this delay time there is no room to read that far ahead, so
+ * compensation is dropped. Both routings then run uncompensated: the left
+ * path is exactly the old behaviour, and the right path adds the latency. */
+#define SEND_RETURN_MIN_COMP_TIME    (SEND_RETURN_LATENCY_SAMPLES + codec_BUFF_LEN / 2)
+
+/* Crossfade between internal read and RETURN when the MIX pot crosses
+ * centre (~5 ms). It only affects the feedback, because the wet output is
+ * zero in the dead zone where the switch happens. */
+#define RETURN_XFADE_STEP_Q15        (32768 / 240)
+
+extern volatile uint8_t mix_use_return;
+extern volatile uint32_t clkout_trigger_tmr;
+
+static int32_t sr_comp_line[NUM_CHAN][SEND_RETURN_LATENCY_SAMPLES];
+static uint16_t sr_comp_pos[NUM_CHAN] = {0, 0};
+static int32_t return_gain_q15[NUM_CHAN] = {0, 0};
+
+/* How many samples closer to the write head the read head runs, and so how
+ * long the internal stand-in for the send/return cable is. */
+static uint32_t read_latency_comp(uint8_t channel)
+{
+	return (divmult_time[channel] >= SEND_RETURN_MIN_COMP_TIME) ? SEND_RETURN_LATENCY_SAMPLES : 0;
+}
 
 float lpf_coef;
 int32_t min_vol;
-float mainin_lpf[2]={0.0,0.0}, auxin_lpf[2]={0.0,0.0};
+float mainin_lpf[2]={0.0,0.0};
 /* DC-block state: Q23.8 fixed-point (8 fractional bits) so a small DC
  * offset (~< 1 sample) can still be tracked across many ISR calls.  Alpha
  * is 1/4096 (shift 12) — corresponds to cutoff ~1.86 Hz @ 48 kHz, very
@@ -238,7 +315,7 @@ static int32_t varispeed_distance_samples(uint8_t channel)
 {
 	const int32_t ring = (int32_t)loop_size[channel];
 
-	target_read_addr[channel] = calculate_read_addr(channel, divmult_time[channel]);
+	target_read_addr[channel] = calculate_read_addr(channel, divmult_time[channel] - read_latency_comp(channel));
 
 	int32_t distance = (int32_t)target_read_addr[channel] - (int32_t)read_addr[channel];
 
@@ -255,6 +332,192 @@ static int32_t varispeed_distance_samples(uint8_t channel)
 		distance = -distance;
 
 	return (distance / (int32_t)SAMPLESIZE);
+}
+
+/*
+ * clock_tick_in_block()
+ *
+ * Which sample of the block being processed a clock tick lands on, as heard at
+ * the outputs, or -1 if none does. The tick is the CLOCK OUT edge
+ * (clkout_trigger_tmr wrapping), which an incoming ping resets, so it is the
+ * module's tempo grid.
+ *
+ * clkout_trigger_tmr counts samples, but it is read at an unknown point after
+ * the block ended: channel B's ISR can wait behind channel A's. The receive
+ * DMA's remaining count says how far past the end of the block the codec
+ * already is, so that is subtracted back out. Then the timer is lined up with
+ * the audio: the block's input was captured CODEC_ADC_GROUP_DELAY earlier, and
+ * the read head runs read_latency_comp() ahead of what is heard.
+ */
+static int32_t clock_tick_in_block(uint8_t channel, uint16_t block_len, uint32_t comp)
+{
+	const int32_t period = (int32_t)ping_time;
+	DMA_Stream_TypeDef *rx = channel ? AUDIO_I2S2_EXT_DMA_STREAM : AUDIO_I2S3_EXT_DMA_STREAM;
+
+	uint32_t tmr = clkout_trigger_tmr;
+	uint32_t done = codec_BUFF_LEN - DMA_GetCurrDataCounter(rx);
+	uint32_t frames_past_block = (done % (codec_BUFF_LEN / 2)) / 4;		/* 4 halfwords per frame */
+
+	if (period <= (int32_t)block_len)
+		return 0;		/* audio-rate clock: every block has a tick */
+
+	/* Timer value at the last sample of this block, then the first sample
+	 * where the tick falls, counting from the start of this block. */
+	int32_t block_end = (int32_t)tmr - (int32_t)frames_past_block;
+	int32_t j = ((int32_t)block_len - 1 + CODEC_ADC_GROUP_DELAY - (int32_t)comp) - block_end;
+	j %= period;
+	if (j < 0) j += period;
+
+	return (j < (int32_t)block_len) ? j : -1;
+}
+
+/*
+ * update_read_speed()
+ *
+ * Sets read_speed for this block so the read head tracks divmult_time while
+ * keeping the repeats on the clock grid.
+ *
+ * - Big changes (a TIME knob step, the time switch) glide at exactly 2x or
+ *   0.5x. A constant speed rescales everything evenly, so events that were
+ *   on the grid stay on it. The glide starts on a clock tick, because the
+ *   rescale is anchored where it starts. It also lands exactly on the target,
+ *   so no leftover error keeps going round the feedback and drifting.
+ * - A glide covers at most VARISPEED_GLIDE_MAX_PERIODS of the change. At that
+ *   point it has run a whole number of clock periods at a whole-number speed,
+ *   so the head is on the grid again. The rest of the change is a read
+ *   crossfade straight to the target, which is on the grid too, so the
+ *   crossfade itself needs no tick.
+ * - Small errors (clock jitter) are nudged out at up to VARISPEED_NUDGE_RATE,
+ *   also landing exactly.
+ *
+ * All of that is for the quantized TIME modes, where every change is a jump
+ * between clock divisions. With the knob or the jack unquantized, TIME moves
+ * continuously (sweeps, 1V/oct), and waiting for ticks would stop it bending.
+ * There the head glides straight away, easing towards 2x or 0.5x at the
+ * VARISPEED_INERTIA set with PING + TIME, with no glide limit. It still
+ * lands exactly.
+ *
+ * Speed is constant within a block, so the first and last blocks of a glide
+ * use a blended speed. That keeps the distance exact, and the events in those
+ * blocks move by at most a few samples.
+ */
+static void update_read_speed(uint8_t channel, uint16_t block_len)
+{
+	const uint32_t comp = read_latency_comp(channel);
+
+	/* Signed distance to the target in samples, counting the fractional
+	 * position. Positive means the head is behind (the delay is too long). */
+	float dist = (float)varispeed_distance_samples(channel) - fractional_read_pos[channel];
+	float abs_dist = (dist < 0.0f) ? -dist : dist;
+
+	float nudge_max = (float)(divmult_time[channel] / VARISPEED_NUDGE_MAX_FRAC);
+	if (nudge_max < VARISPEED_NUDGE_MAX_SAMPLES) nudge_max = VARISPEED_NUDGE_MAX_SAMPLES;
+
+	const uint8_t clock_locked = (mode[channel][TIMEMODE_POT] == MOD_READWRITE_TIME_Q)
+							  && (mode[channel][TIMEMODE_JACK] == MOD_READWRITE_TIME_Q);
+
+	if (!clock_locked && (abs_dist > nudge_max || vs_state[channel] == VS_GLIDING)) {
+		/* Free glide: ease towards 2x or 0.5x. The budget is refilled so a
+		 * switch back to quantized mid-glide carries on like a fresh glide. */
+		float glide = (dist > 0.0f) ? 2.0f : 0.5f;
+		float slew = param[channel][VARISPEED_INERTIA];
+
+		if (read_speed[channel] < glide) {
+			read_speed[channel] += slew;
+			if (read_speed[channel] > glide) read_speed[channel] = glide;
+		} else if (read_speed[channel] > glide) {
+			read_speed[channel] -= slew;
+			if (read_speed[channel] < glide) read_speed[channel] = glide;
+		}
+		vs_state[channel] = VS_GLIDING;
+		glide_budget[channel] = (float)ping_time * VARISPEED_GLIDE_MAX_PERIODS;
+
+		/* Land exactly, if this block would reach the target */
+		float move = (read_speed[channel] - 1.0f) * (float)block_len;
+		if ((dist > 0.0f && move >= dist) || (dist < 0.0f && move <= dist) || dist == 0.0f) {
+			read_speed[channel] = 1.0f + dist / (float)block_len;
+			vs_state[channel] = VS_SETTLED;
+		}
+		return;
+	}
+	if (!clock_locked && vs_state[channel] != VS_SETTLED)
+		vs_state[channel] = VS_SETTLED;		/* drop a queued tick wait or crossfade */
+
+	if (vs_state[channel] == VS_CROSSFADE) {
+		if (abs_dist > nudge_max) {
+			/* Same crossfade the INF/reverse code uses. The caller sees
+			 * read_fade_pos and reads the destination head; the fade
+			 * lands read_addr on it. */
+			fade_dest_read_addr[channel] = target_read_addr[channel];
+			read_fade_pos[channel] = global_param[SLOW_FADE_INCREMENT];
+			doing_reverse_fade[channel] = 0;
+			fade_queued_dest_divmult_time[channel] = 0;
+			fractional_read_pos[channel] = 0.0f;
+		}
+		/* Otherwise TIME moved back near where the glide stopped: nudge */
+		vs_state[channel] = VS_SETTLED;
+		read_speed[channel] = 1.0f;
+		return;
+	}
+
+	if (vs_state[channel] != VS_GLIDING) {
+		if (abs_dist > nudge_max) {
+			int32_t tick = clock_tick_in_block(channel, block_len, comp);
+			if (tick < 0) {
+				/* Hold the current delay time until the tick */
+				vs_state[channel] = VS_WAITING;
+				read_speed[channel] = 1.0f;
+				return;
+			}
+			/* Tick in this block: glide from that sample on */
+			vs_state[channel] = VS_GLIDING;
+			glide_budget[channel] = (float)ping_time * VARISPEED_GLIDE_MAX_PERIODS;
+			float glide = (dist > 0.0f) ? 2.0f : 0.5f;
+			read_speed[channel] = 1.0f + (glide - 1.0f) * (float)(block_len - tick) / (float)block_len;
+		}
+		else {
+			vs_state[channel] = VS_SETTLED;
+
+			if (abs_dist < VARISPEED_ARRIVED) {
+				/* Arrived: sit exactly on the target at 1x, so
+				 * memory_read_varispeed's single-read fast path runs */
+				read_addr[channel] = target_read_addr[channel];
+				fractional_read_pos[channel] = 0.0f;
+				read_speed[channel] = 1.0f;
+				return;
+			}
+
+			float step = dist;
+			float max_step = VARISPEED_NUDGE_RATE * (float)block_len;
+			if (step > max_step) step = max_step;
+			if (step < -max_step) step = -max_step;
+			read_speed[channel] = 1.0f + step / (float)block_len;
+			return;
+		}
+	}
+	else {
+		/* Keep gliding. If the target moved past us (TIME changed again
+		 * mid-glide), turn round: the head is already off the grid's
+		 * anchor, so there is nothing to wait for. */
+		read_speed[channel] = (dist > 0.0f) ? 2.0f : 0.5f;
+	}
+
+	/* Land exactly on the target in the block that would otherwise overshoot */
+	float move = (read_speed[channel] - 1.0f) * (float)block_len;
+	if ((dist > 0.0f && move >= dist) || (dist < 0.0f && move <= dist) || dist == 0.0f) {
+		read_speed[channel] = 1.0f + dist / (float)block_len;
+		vs_state[channel] = VS_SETTLED;
+		return;
+	}
+
+	/* Or stop exactly where the budget runs out, and crossfade next block */
+	float abs_move = (move < 0.0f) ? -move : move;
+	if (abs_move >= glide_budget[channel]) {
+		read_speed[channel] = 1.0f + ((move < 0.0f) ? -glide_budget[channel] : glide_budget[channel]) / (float)block_len;
+		glide_budget[channel] = 0.0f;
+		vs_state[channel] = VS_CROSSFADE;
+	} else
+		glide_budget[channel] -= abs_move;
 }
 
 void swap_read_write(uint8_t channel){
@@ -600,6 +863,8 @@ void change_inf_mode(uint8_t channel)
 				reset_loopled_tmr(channel);
 
 				loop_start[channel] = fade_dest_read_addr[channel]; //use the dest because if we happen to be fading the read head when we hit inf (e.g. changing divmult time) then we should loop between the new points since divmult_time (used in the next line) corresponds with the dest
+				//The read head runs read_latency_comp() ahead of the delay time (see SEND_RETURN_LATENCY_SAMPLES), so step back to where the delay time really starts; otherwise the loop's tail would run past the write head into unwritten audio
+				loop_start[channel] = offset_samples(channel, loop_start[channel], read_latency_comp(channel), 1-mode[channel][REV]);
 				loop_end[channel] = offset_samples(channel, loop_start[channel], divmult_time[channel], mode[channel][REV]);
 			}
 			write_fade_pos[channel] = global_param[SLOW_FADE_INCREMENT];
@@ -649,8 +914,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	static uint32_t mute_on_boot_ctr=96000;
 	static uint8_t auto_muting_main_state[NUM_CHAN]={0,0};
 	static float auto_muting_main_fade[NUM_CHAN]={0,0};
-	static uint8_t auto_muting_aux_state[NUM_CHAN]={0,0};
-	static float auto_muting_aux_fade[NUM_CHAN]={0,0};
 
 	/* Channel B's per-sample contribution to the mono reverb input, handed
 	 * across to channel A's ISR, which is the one that pushes into the reverb.
@@ -668,6 +931,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	int32_t mainin_atten;   /* was float — now Q-format int from Q15 mul */
 	int32_t auxin;
 	int32_t auxout;
+	int32_t loop_rd;        /* delay read as the loop sees it: internal, or via RETURN */
 
 	/* Pre-compute Q15 versions of params used in the inner loop, so we do
 	 * one VCVT+VMUL per param up front instead of per sample × 4 iters. */
@@ -684,6 +948,10 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 	/* Top 10% of the right MIX pot fades the dry+delay path out (set by
 	 * params.c), so at max the output is 100% wet reverb. */
 	const int32_t dry_gain_q15 = (int32_t)(reverb_dry_gain * 32768.0f);
+	/* Send/Return routing for this block: which side of centre the MIX pot
+	 * is on, and how long the internal stand-in for the cable is. */
+	const int32_t return_target_q15 = mix_use_return ? 32768 : 0;
+	const uint32_t comp = read_latency_comp(channel);
 
 	uint16_t i,t;
 	uint16_t topbyte, bottombyte;
@@ -752,40 +1020,17 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			// holding 1x keeps rd_buff and rd_buff_dest sample-aligned so they
 			// can actually be mixed. Catch-up resumes on the block after
 			// increment_read_fade drops read_addr on its destination.
-			target_read_speed[channel] = 1.0f;
 			read_speed[channel] = 1.0f;
 			fractional_read_pos[channel] = 0.0f;
 		} else {
-			int32_t distance_samples = varispeed_distance_samples(channel);
-
-			if (distance_samples >= -VARISPEED_DEADBAND_SAMPLES && distance_samples <= VARISPEED_DEADBAND_SAMPLES) {
-				// Arrived: snap to normal speed and zero the fractional
-				// position so memory_read_varispeed's 1x fast path fires
-				// (single SDRAM read per sample instead of two for interp).
-				target_read_speed[channel] = 1.0f;
-				read_speed[channel] = 1.0f;
-				fractional_read_pos[channel] = 0.0f;
-			} else {
-				// Behind the target: speed up. Ahead of it: slow down. Then
-				// slew toward that speed at the configured inertia.
-				target_read_speed[channel] = (distance_samples > 0) ? 2.0f : 0.5f;
-
-				float slew = param[channel][VARISPEED_INERTIA];
-				if (read_speed[channel] < target_read_speed[channel]) {
-					read_speed[channel] += slew;
-					if (read_speed[channel] > target_read_speed[channel])
-						read_speed[channel] = target_read_speed[channel];
-				} else if (read_speed[channel] > target_read_speed[channel]) {
-					read_speed[channel] -= slew;
-					if (read_speed[channel] < target_read_speed[channel])
-						read_speed[channel] = target_read_speed[channel];
-				}
-			}
+			update_read_speed(channel, sz/2);
 		}
 
 		crossed_start_fade_addr = memory_read_varispeed(read_addr, &fractional_read_pos[channel], channel, rd_buff, sz/2, read_speed[channel], start_fade_addr, doing_reverse_fade[channel]);
 	} else {
-		// Freeze modes: use original memory_read
+		// Freeze modes: use original memory_read. Drop any queued or
+		// half-done glide; the head is re-measured when INF ends.
+		vs_state[channel] = VS_SETTLED;
 		crossed_start_fade_addr = memory_read(read_addr, channel, rd_buff, sz/2, start_fade_addr, doing_reverse_fade[channel]);
 	}
 
@@ -885,12 +1130,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			if (mainin_lpf[channel]>=min_vol && (auto_muting_main_state[channel] == FADING_DOWN || auto_muting_main_state[channel]==MUTED))
 				auto_muting_main_state[channel] =  FADING_UP;
 
-			auxin_lpf[channel] = (auxin_lpf[channel]*(1.0f-lpf_coef)) + (((auxin>0)?auxin:(-1*auxin))*lpf_coef);
-			if (auxin_lpf[channel]<min_vol && (auto_muting_aux_state[channel] == FADING_UP || auto_muting_aux_state[channel]==UNMUTED))
-				auto_muting_aux_state[channel] =  FADING_DOWN;
-			if (auxin_lpf[channel]>=min_vol && (auto_muting_aux_state[channel] == FADING_DOWN || auto_muting_aux_state[channel]==MUTED))
-				auto_muting_aux_state[channel] =  FADING_UP;
-
 			if (auto_muting_main_state[channel] == FADING_DOWN)
 				auto_muting_main_fade[channel] -= AUTO_MUTE_DECAY;
 			else if (auto_muting_main_state[channel] == FADING_UP)
@@ -907,21 +1146,6 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			else if (auto_muting_main_state[channel] != UNMUTED)
 				mainin = (float)mainin * auto_muting_main_fade[channel];
 
-			if (auto_muting_aux_state[channel] == FADING_DOWN)
-				auto_muting_aux_fade[channel] -= AUTO_MUTE_DECAY;
-			else if (auto_muting_aux_state[channel] == FADING_UP)
-				auto_muting_aux_fade[channel] += AUTO_MUTE_ATTACK;
-			if (auto_muting_aux_fade[channel] <= 0.0f) {
-				auto_muting_aux_fade[channel] = 0.0f;
-				auto_muting_aux_state[channel] = MUTED;
-			} else if (auto_muting_aux_fade[channel] >= 1.0f) {
-				auto_muting_aux_fade[channel] = 1.0f;
-				auto_muting_aux_state[channel] = UNMUTED;
-			}
-			if (auto_muting_aux_state[channel] == MUTED)
-				auxin = 0;
-			else if (auto_muting_aux_state[channel] != UNMUTED)
-				auxin = (float)auxin * auto_muting_aux_fade[channel];
 		}
 
 
@@ -949,24 +1173,48 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 		if (SAMPLESIZE==2)
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (rd) : [src] "r" (rd));
 
+		/* Send/Return insert in the delay loop (see SEND_RETURN_LATENCY_SAMPLES).
+		 * SEND always carries the buffer read. What the rest of the loop
+		 * treats as "the read" (loop_rd, used for regen and the wet output)
+		 * is either that same read, delayed by the internal stand-in for the
+		 * cable, or the RETURN jack. Which one depends on the side of the
+		 * MIX pot, with a short crossfade when it changes. */
+		auxout = rd;
+
+		if (comp) {
+			int32_t delayed = sr_comp_line[channel][sr_comp_pos[channel]];
+			sr_comp_line[channel][sr_comp_pos[channel]] = rd;
+			if (++sr_comp_pos[channel] >= SEND_RETURN_LATENCY_SAMPLES)
+				sr_comp_pos[channel] = 0;
+			rd = delayed;
+		}
+
+		if (return_gain_q15[channel] != return_target_q15) {
+			if (return_gain_q15[channel] < return_target_q15) {
+				return_gain_q15[channel] += RETURN_XFADE_STEP_Q15;
+				if (return_gain_q15[channel] > return_target_q15)
+					return_gain_q15[channel] = return_target_q15;
+			} else {
+				return_gain_q15[channel] -= RETURN_XFADE_STEP_Q15;
+				if (return_gain_q15[channel] < return_target_q15)
+					return_gain_q15[channel] = return_target_q15;
+			}
+		}
+
+		if (return_gain_q15[channel] == 32768)
+			loop_rd = auxin;
+		else if (return_gain_q15[channel] == 0)
+			loop_rd = rd;
+		else
+			loop_rd = rd + (((auxin - rd) * return_gain_q15[channel]) >> 15);
+
 		/* Integer Q15-format multiplies replace the per-sample float math.
 		 * regen_q15 / level_q15 / mix_dry_q15 / mix_wet_q15 are pre-computed
 		 * once per ISR above. */
-		regen        = (rd     * regen_q15) >> 15;
-		mainin_atten = (mainin * level_q15) >> 15;
+		regen        = (loop_rd * regen_q15) >> 15;
+		mainin_atten = (mainin  * level_q15) >> 15;
 
-		/* Send/Return is an insert between the DELAY and the REVERB. (It used
-		 * to be an insert in the delay feedback loop, selected by
-		 * SEND_RETURN_BEFORE_LOOP; that routing is gone.)
-		 *
-		 * SEND carries the delay engine output only — no dry — so an external
-		 * processor sees just the repeats. RETURN is picked up further down
-		 * and routed into the reverb input; it deliberately never reaches the
-		 * loop write or the dry path, so whatever is patched in colours the
-		 * reverb without feeding back into the delay or leaking into the dry
-		 * output. */
 		wr     = regen + mainin_atten;
-		auxout = rd;
 
 		/* DC blocker as a 1-pole IIR in Q23.8 fixed point.
 		 *   state += ((wr << 8) - state) >> 12         alpha ≈ 1/4096
@@ -990,7 +1238,7 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (wr) : [src] "r" (wr));
 
 		// Wet/dry mix in Q15.
-		mix = ((dry * mix_dry_q15) + (rd * mix_wet_q15)) >> 15;
+		mix = ((dry * mix_dry_q15) + (loop_rd * mix_wet_q15)) >> 15;
 
 		if (global_mode[SOFTCLIP])
 			mix = compress(mix);
@@ -999,24 +1247,15 @@ void process_audio_block_codec(int16_t *src, int16_t *dst, int16_t sz, uint8_t c
 			asm("ssat %[dst], #16, %[src]" : [dst] "=r" (mix) : [src] "r" (mix));
 
 #ifdef REVERB_ENABLE
-		/* --- Reverb: fed by a mono sum of both channels, plus the RETURNs ---
+		/* --- Reverb: fed by a mono sum of both channels ---
 		 * Right MIX scales the audio FED INTO the reverb. The reverb's stereo
 		 * output is then summed unscaled into the per-channel mix. So the
 		 * right MIX controls how hard the reverb is driven; the tail you hear
-		 * scales with that drive, but the output mix is never silenced.
-		 *
-		 * Each channel contributes its delay mix plus its RETURN jack. The
-		 * return is SUMMED with the internal feed rather than replacing it:
-		 * these jacks have no plug detection and no hardware normalling, so a
-		 * replacing insert would silence the reverb whenever nothing is
-		 * patched. Scaling the sum by the right MIX keeps that pot's meaning
-		 * intact — it still sets reverb drive, for the returned signal too. */
+		 * scales with that drive, but the output mix is never silenced. */
 		{
 			int16_t rev_s;
 			/* This channel's contribution to the mono reverb input. */
-			int32_t rev_contrib = mix + auxin;
-			if (SAMPLESIZE==2)
-				asm("ssat %[dst], #16, %[src]" : [dst] "=r" (rev_contrib) : [src] "r" (rev_contrib));
+			int32_t rev_contrib = mix;
 
 			if (channel == 0) {
 				/* Mono-sum both channels, averaged so correlated material

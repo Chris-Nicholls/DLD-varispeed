@@ -222,4 +222,10 @@ extern volatile uint8_t input_queue_max;
  * Decay is driven by the right REGEN pot; Tone by the right LEVEL pot. */
 void velvet_reverb_apply_decay_macro  (float v);
 void velvet_reverb_apply_tone_macro   (float v);
+
+/* Octave shift on the reverb input: +1 = up, -1 = down, 0 = off. The shifted
+ * signal is blended equally with the unshifted one, and it goes in ahead of
+ * the sustain engine so it is shifted once (a fixed offset, not shimmer).
+ * Changes crossfade over ~20 ms. */
+void velvet_reverb_set_octave(int8_t octave);
 void velvet_reverb_recompute_macros   (void);

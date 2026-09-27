@@ -65,6 +65,15 @@ extern uint8_t doing_reverse_fade[NUM_CHAN];
 
 
 float param[NUM_CHAN][NUM_PARAMS];
+
+/* MIX pot geometry (ADC counts). See the MIX section of update_params(). */
+#define MIX_CENTRE		2048
+#define MIX_DEADZONE	80		/* ~2% of travel each side of 12 o'clock */
+#define MIX_SIDE_HYST	40		/* inside the dead zone, so the flip is silent */
+
+/* 1 when the left MIX pot is right of centre: wet and feedback come from the
+ * RETURN jack instead of the delay buffer. Drives both delay channels. */
+volatile uint8_t mix_use_return = 0;
 float global_param[NUM_GLOBAL_PARAMS];
 uint8_t mode[NUM_CHAN][NUM_CHAN_MODES];
 uint8_t global_mode[NUM_GLOBAL_MODES];
@@ -287,7 +296,8 @@ void process_adc(void)
 
 	for (i=0;i<NUM_CHAN;i++)
 	{
-		//PING + TIME sets varispeed inertia
+		//PING + TIME sets varispeed inertia (used in the unquantized TIME modes only;
+		//quantized glides run at a fixed speed to stay on the clock grid)
 		// min = 1ms, 12 o'clock = ~250ms, max = 1000ms
 		if (flag_pot_changed_pingdown[TIME_POT*2+i])
 		{
@@ -569,8 +579,19 @@ void update_params(void)
 // ******* MIX **********
 
 		//
-		// MIX uses an equal power panning lookup table
-		// Each MIX pot sets two parameters: wet and dry
+		// MIX is bipolar around 12 o'clock, which is fully dry. The dry
+		// signal stays at full level across the whole knob; the distance from
+		// centre only brings the wet in (on the rising half of the equal-power
+		// curve), and the side picks where the wet signal (and the feedback)
+		// comes from:
+		//   Left  of centre: the delay buffer read, return jack bypassed
+		//   Right of centre: the RETURN jack, i.e. the send/return is an
+		//                    insert in the delay loop (see looping_delay.c)
+		// Either end has dry and wet both at unity. MIX_DEADZONE around
+		// centre stays fully dry so 12 o'clock is easy to find. The side only
+		// flips once the knob
+		// is MIX_SIDE_HYST past centre, so pot noise at 12 o'clock can't
+		// chatter the routing back and forth.
 		//
 
 		if (mode[channel][LEVELCV_IS_MIX])
@@ -587,8 +608,19 @@ void update_params(void)
 		 * channel 0 below, not from the right MIX pot. The right MIX pot's
 		 * wet value is captured into reverb_send separately. */
 		if (channel == 0) {
-			param[channel][MIX_DRY]=epp_lut[t_combined];
-			param[channel][MIX_WET]=epp_lut[4095 - t_combined];
+			int32_t from_centre = t_combined - MIX_CENTRE;
+			int32_t wet_idx = (from_centre < 0 ? -from_centre : from_centre) - MIX_DEADZONE;
+			if (wet_idx < 0) wet_idx = 0;
+			wet_idx = (wet_idx * 4095) / (MIX_CENTRE - MIX_DEADZONE);
+			if (wet_idx > 4095) wet_idx = 4095;
+
+			if (from_centre > MIX_SIDE_HYST)
+				mix_use_return = 1;
+			else if (from_centre < -MIX_SIDE_HYST)
+				mix_use_return = 0;
+
+			param[channel][MIX_DRY]=1.0f;
+			param[channel][MIX_WET]=epp_lut[4095 - wet_idx];
 		}
 
 	}
@@ -619,6 +651,13 @@ void update_params(void)
 		if (t < 0) t = 0;
 		if (t > 4095) t = 4095;
 		velvet_reverb_apply_tone_macro((float)t * (1.0f / 4095.0f));
+
+		/* Right time switch → reverb octave: up = +1 octave, down = -1,
+		 * centre = off. (The left switch sets both delays' time range.) */
+		{
+			uint8_t sw = get_switch_val(1);
+			velvet_reverb_set_octave(sw == SWITCH_UP ? 1 : (sw == SWITCH_DOWN ? -1 : 0));
+		}
 
 		/* Right REGEN → Decay macro */
 		t = (int32_t)i_smoothed_potadc[REGEN_POT*2+1] + (int32_t)i_smoothed_cvadc[REGEN*2+1];
@@ -730,9 +769,11 @@ uint8_t get_switch_val(uint8_t channel)
 }
 
 
-// Adjust TIME by the time switch position
+// Adjust TIME by the time switch position. The LEFT switch sets the range for
+// both delay channels; the right switch picks the reverb octave instead (see
+// the reverb wiring in update_params).
 float adjust_time_by_switch(float val, uint8_t channel){
-	uint8_t switch_val = get_switch_val(channel);
+	uint8_t switch_val = get_switch_val(0);
 
 	if (switch_val==0b10) return(val + 16.0); //switch up: 17-32
 	if (switch_val==0b01) return(val * 0.125); //switch down: eighth notes

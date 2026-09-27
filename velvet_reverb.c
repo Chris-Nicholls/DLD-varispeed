@@ -526,6 +526,11 @@ static float lpf_hz_morph   = 8600.0f;
 static float hpf_hz_morph   = 170.0f;
 static float fb_hs_hz_morph = 2000.0f;
 
+/* Reverb octave switch position (+1 up, -1 down, 0 off), set by
+ * velvet_reverb_set_octave. Declared up here because the HPF morph below
+ * follows it as well as the octave feed heads. */
+static volatile int8_t oct_request = 0;
+
 /* ==== Pre-delay sustain engine state ====
  * Two float feedback delay lines in SDRAM (see velvet_reverb.h). Shared loop
  * gain + shelves (tone/damping), per-line modulation + DC block, input duck,
@@ -859,6 +864,9 @@ __attribute__((always_inline)) static inline float biquad_process(Biquad *bq, fl
     bq->z2 = bq->b2 * x - bq->a2 * y;
     return y;
 }
+
+/* Octave shift feed heads: see do_predelay(). */
+static void oct_init(void);
 
 /* ==== DMA2 Stream1 helpers (T2 SDRAM prefetch) ==== */
 #ifdef VELVET_REVERB_HOST
@@ -1240,6 +1248,7 @@ void velvet_reverb_init(void)
     biquad_lpf(&lpf_R, reverb_lpf_hz, 48000.0f);
     last_hpf_hz = reverb_hpf_hz;
     last_lpf_hz = reverb_lpf_hz;
+    oct_init();
     lpf_hz_morph = reverb_lpf_hz;
     hpf_hz_morph = reverb_hpf_hz;
 
@@ -1680,7 +1689,10 @@ static void update_morph_state(void)
     /* Smooth the Tone-macro cutoffs so biquad coeffs track a continuous sweep
      * (no staircase zipper). do_finalize / do_predelay recompute from these. */
     lpf_hz_morph   += ALPHA_WINDOW_MORPH * (reverb_lpf_hz          - lpf_hz_morph);
-    hpf_hz_morph   += ALPHA_WINDOW_MORPH * (reverb_hpf_hz          - hpf_hz_morph);
+    /* Octave down drops the HPF an octave too (the default 170 Hz becomes 85),
+     * so the shifted-down tail keeps its low end. The morph glides it. */
+    float hpf_goal = (oct_request < 0) ? 0.5f * reverb_hpf_hz : reverb_hpf_hz;
+    hpf_hz_morph   += ALPHA_WINDOW_MORPH * (hpf_goal               - hpf_hz_morph);
     fb_hs_hz_morph += ALPHA_WINDOW_MORPH * (reverb_fb_high_shelf_hz - fb_hs_hz_morph);
 }
 
@@ -1910,6 +1922,151 @@ __attribute__((always_inline)) static inline float fast_sin_pi(float x)
     return x * (1.0f + x2 * (-0.16666666f + x2 * 0.00833333f));
 }
 
+/* ==== Octave shift: feed heads on the pre-delay loop ====
+ *
+ * Each pre-delay line gets a second read head that feeds the cascade at 2x
+ * (octave up) or 0.5x (octave down). The feedback read stays at 1x, so the
+ * loop never recirculates shifted audio: the tail comes out an octave away,
+ * once, rather than climbing as shimmer.
+ *
+ * A head reading at 2x gains one sample per sample on the write head (at
+ * 0.5x it falls back half a sample), so it has to jump back every so often.
+ * It jumps by exactly the line's loop length. One loop back, the line holds
+ * nearly the same audio (the same recirculating tail, one feedback pass
+ * older), so the jump lands on matching material and a short crossfade covers
+ * the rest: fresh input that arrived in the meantime, and the loop's
+ * modulation. Between jumps the head is clean varispeed, 185 or 300 ms at a
+ * time, and the two lines' jumps never line up.
+ *
+ * The shifted feed is blended equally with the normal one. */
+/* SDRAM cost. The lines live in SDRAM on a 16-bit bus, so a random float
+ * read is slow, and the heads would need up to four per head per sample
+ * (plus as many again during a jump's crossfade). Instead each head copies the
+ * stretch of line it will cover in the coming block into fast memory once,
+ * with sequential reads (at 2x that is ~34 samples, at 0.5x ~10), and the
+ * per-sample reads come from the copy. For that to be valid a head never
+ * reads audio written during the current block, hence OCT_MIN_DELAY, and
+ * jumps and direction changes happen only at block boundaries. */
+#define OCT_MIN_DELAY    ((float)REVERB_BLOCK + 2.0f)   /* reads stay behind this block's writes */
+#define OCT_XFADE        600                 /* 25 ms @ 24 kHz */
+#define OCT_SPAN         (2 * REVERB_BLOCK + 2)         /* samples a 2x head covers in a block, plus interp */
+#define OCT_SPAN_DOWN    (REVERB_BLOCK / 2 + 3)         /* ...and a 0.5x head */
+#define OCT_RAMP_BINS    256
+#define OCT_MIX_GAIN     0.70710678f         /* equal-power blend at full */
+#define OCT_FADE_STEP    (1.0f / 480.0f)     /* 20 ms to fade in or out */
+
+typedef struct {
+    float d;               /* delay of the main feed head, in samples */
+    float xd;              /* delay of the head being faded out */
+    int32_t xleft, xlen;   /* crossfade samples left / total (xleft 0 = none) */
+    uint32_t base, xbase;  /* line index (unmasked) of lb[0] / xlb[0] */
+    float lb[OCT_SPAN];    /* this block's stretch of line for each head */
+    float xlb[OCT_SPAN];
+} OctHead;
+
+static OctHead oct_head_a CCM_ATTR, oct_head_b CCM_ATTR;
+static float oct_ramp[OCT_RAMP_BINS + 1];    /* sin^2 from 0 to 1 */
+static float oct_gain = 0.0f;                /* 0 = off, 1 = full blend */
+static int8_t oct_active = 0;                /* direction the heads are running */
+
+void velvet_reverb_set_octave(int8_t octave)
+{
+    oct_request = (octave > 0) ? 1 : ((octave < 0) ? -1 : 0);
+}
+
+static void oct_init(void)
+{
+    for (int i = 0; i <= OCT_RAMP_BINS; i++) {
+        float x = sinf(0.5f * PI_F * (float)i / (float)OCT_RAMP_BINS);
+        oct_ramp[i] = x * x;
+    }
+    oct_gain = 0.0f; oct_active = 0;
+    memset(&oct_head_a, 0, sizeof oct_head_a);
+    memset(&oct_head_b, 0, sizeof oct_head_b);
+}
+
+/* Start a head where its sweep begins: a loop back for up, as close to the
+ * write head as allowed for down. */
+static void oct_head_start(OctHead *h, float loop, int up)
+{
+    h->d = up ? loop + OCT_MIN_DELAY : OCT_MIN_DELAY;
+    h->xleft = 0;
+}
+
+/* Copy the stretch of line a head at delay d0 will read over the next nsamp
+ * samples. lb[0] is one sample older than its first read, so the 2x
+ * average's extra tap fits. */
+static void oct_fetch(float *lb, uint32_t *base, const float *line, uint32_t w0, float d0, int up, int nsamp)
+{
+    *base = w0 - (uint32_t)ceilf(d0) - 1u;
+    const int k = up ? (2 * nsamp + 2) : (nsamp / 2 + 3);
+    for (int i = 0; i < k; i++)
+        lb[i] = line[(*base + (uint32_t)i) & PRE_DELAY_LINE_MASK];
+}
+
+/* Block start for one head: jump if due, then fetch. w0 is the write index at
+ * the block's first sample, loop the line's current loop length. */
+static void oct_head_begin_block(OctHead *h, const float *line, uint32_t w0, float loop, int up)
+{
+    if (h->xleft == 0) {
+        /* Up: jump while the outgoing head still has a whole crossfade of
+         * room above OCT_MIN_DELAY (checked a block early, since jumps only
+         * happen here). Down: once a whole loop of room has opened up. */
+        if (up ? (h->d < OCT_MIN_DELAY + (float)OCT_XFADE + (float)REVERB_BLOCK)
+               : (h->d >= loop + OCT_MIN_DELAY)) {
+            int32_t len = OCT_XFADE;
+            if (up && (int32_t)(h->d - OCT_MIN_DELAY) < len)
+                len = (int32_t)(h->d - OCT_MIN_DELAY);    /* only with a very short loop */
+            if (len > 0) {
+                h->xd = h->d;
+                h->xleft = h->xlen = len;
+            }
+            h->d += up ? loop : -loop;
+        }
+    }
+    oct_fetch(h->lb, &h->base, line, w0, h->d, up, REVERB_BLOCK);
+    /* The outgoing head only runs until its crossfade ends. Fetching a
+     * whole block for it would reach past the write head (never read, but
+     * wasted SDRAM reads). */
+    if (h->xleft > 0)
+        oct_fetch(h->xlb, &h->xbase, line, w0, h->xd, up, (h->xleft < REVERB_BLOCK) ? h->xleft : REVERB_BLOCK);
+}
+
+/* Read at rel samples into a fetched stretch. At 2x, average with the
+ * previous sample first: reading at 2x decimates the line, and this is the
+ * same 2-tap filter the input decimator uses. */
+__attribute__((always_inline)) static inline float oct_lb_read(const float *lb, float rel, int up)
+{
+    int32_t i = (int32_t)rel;
+    float f = rel - (float)i;
+    float b = lb[i], c = lb[i + 1];
+    float v = b + f * (c - b);
+    if (up) {
+        float a = lb[i - 1];
+        v = 0.5f * (v + a + f * (b - a));
+    }
+    return v;
+}
+
+/* One sample from a head, the n'th of the block that started at w0. */
+__attribute__((always_inline)) static inline float oct_head_sample(OctHead *h, uint32_t w0, int n, int up)
+{
+    float y = oct_lb_read(h->lb, (float)(int32_t)(w0 + (uint32_t)n - h->base) - h->d, up);
+
+    if (h->xleft > 0) {
+        float yo = oct_lb_read(h->xlb, (float)(int32_t)(w0 + (uint32_t)n - h->xbase) - h->xd, up);
+        float w = oct_ramp[((h->xlen - h->xleft) * OCT_RAMP_BINS) / h->xlen];
+        y = yo + w * (y - yo);
+        h->xd += up ? -1.0f : 0.5f;
+        h->xleft--;
+    }
+
+    /* Up: the delay shrinks by one sample per sample (a 2x read). Down: it
+     * grows by half a sample per sample (a 0.5x read). */
+    h->d += up ? -1.0f : 0.5f;
+    return y;
+}
+
 /* ==== Pre-delay sustain engine ====
  * Two modulated, damped feedback delay lines in front of the cascade. Reads
  * input_ready (int16), works in normalised ±1 float (so duck / node-clamp /
@@ -1970,14 +2127,43 @@ static void do_predelay(void)
         last_fb_hs_hz = fb_hs_hz_morph; last_fb_hs_db = reverb_fb_high_shelf_db;
     }
 
-    if (fb <= 0.0f) {
-        /* Bypass: dry input straight to the cascade (loop off). */
-        for (int n = 0; n < REVERB_BLOCK; n++)
-            predelay_out[n] = (float)input_ready[n] * to_unit;
+    if (fb <= 0.0f && oct_active == 0 && oct_request == 0) {
+        /* Bypass: dry input straight to the cascade (loop off). The lines
+         * still take the input, which is exactly what the loop would write
+         * with no feedback, so the octave feed heads find fresh audio if the
+         * octave is switched on later. */
+        for (int n = 0; n < REVERB_BLOCK; n++) {
+            float px = (float)input_ready[n] * to_unit;
+            predelay_out[n] = px;
+            predelay_a[(predelay_wh + (uint32_t)n) & PRE_DELAY_LINE_MASK] = px;
+            predelay_b[(predelay_wh + (uint32_t)n) & PRE_DELAY_LINE_MASK] = px;
+        }
         /* Keep the write head advancing so resuming feedback reads sane history. */
         predelay_wh += REVERB_BLOCK;
         if (predelay_wh >= REVERB_IDX_WRAP) predelay_wh -= REVERB_IDX_WRAP;
         return;
+    }
+
+    /* Octave feed heads: direction changes (once faded out) and jumps happen
+     * here, at the block boundary, and each head fetches its stretch of line.
+     * Loop lengths use the modulation as it stands at the block start. */
+    const uint32_t w0 = predelay_wh;
+    if (oct_gain == 0.0f && oct_request != oct_active) {
+        oct_active = oct_request;
+        if (oct_active != 0) {
+            float fa = pre_mod_phase_a; if (fa > PI_F) fa -= TWO_PI_F;
+            float fb_ = pre_mod_phase_b; if (fb_ > PI_F) fb_ -= TWO_PI_F;
+            oct_head_start(&oct_head_a, timeA + modDepth * (1.0f + fast_sin_pi(fa)), oct_active > 0);
+            oct_head_start(&oct_head_b, timeB + modDepth * (1.0f + fast_sin_pi(fb_)), oct_active > 0);
+        }
+    }
+    const int oct_run = (oct_active != 0);
+    const int up = (oct_active > 0);
+    if (oct_run) {
+        float fa = pre_mod_phase_a; if (fa > PI_F) fa -= TWO_PI_F;
+        float fb_ = pre_mod_phase_b; if (fb_ > PI_F) fb_ -= TWO_PI_F;
+        oct_head_begin_block(&oct_head_a, predelay_a, w0, timeA + modDepth * (1.0f + fast_sin_pi(fa)), up);
+        oct_head_begin_block(&oct_head_b, predelay_b, w0, timeB + modDepth * (1.0f + fast_sin_pi(fb_)), up);
     }
 
     for (int n = 0; n < REVERB_BLOCK; n++) {
@@ -2031,7 +2217,32 @@ static void do_predelay(void)
         if (nodeB > 4.0f) nodeB = 4.0f; else if (nodeB < -4.0f) nodeB = -4.0f;
         predelay_b[predelay_wh & PRE_DELAY_LINE_MASK] = nodeB;
 
-        predelay_out[n] = px + mix * (nodeA + nodeB - px);
+        float feed = px + mix * (nodeA + nodeB - px);
+
+        /* Octave: a direction change fades out, the heads restart at the
+         * next block boundary, then it fades back in */
+        if (oct_request != oct_active) {
+            oct_gain -= OCT_FADE_STEP;
+            if (oct_gain < 0.0f) oct_gain = 0.0f;
+        } else if (oct_active != 0 && oct_gain < 1.0f) {
+            oct_gain += OCT_FADE_STEP;
+            if (oct_gain > 1.0f) oct_gain = 1.0f;
+        }
+
+        if (oct_run) {
+            /* The heads advance every sample while running, gain or not,
+             * so they stay in step with their fetched stretches. */
+            float sA = oct_head_sample(&oct_head_a, w0, n, up);
+            float sB = oct_head_sample(&oct_head_b, w0, n, up);
+            /* Shifted counterpart of feed = px + mix * (nodeA + nodeB - px).
+             * There is no separate shifted px: the lines carry it, but the
+             * heads read the two lines at different delays, so it adds up
+             * incoherently. (sA + sB) / sqrt(2) stands in for it. */
+            float shifted = ((1.0f - mix) * 0.70710678f + mix) * (sA + sB);
+            feed = (1.0f + (OCT_MIX_GAIN - 1.0f) * oct_gain) * feed + (OCT_MIX_GAIN * oct_gain) * shifted;
+        }
+
+        predelay_out[n] = feed;
         predelay_wh++;
         if (predelay_wh >= REVERB_IDX_WRAP) predelay_wh -= REVERB_IDX_WRAP;
     }
